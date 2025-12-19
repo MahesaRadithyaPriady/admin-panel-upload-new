@@ -5,27 +5,38 @@ import { useSearchParams, useParams, useNavigate, useLocation } from "react-rout
 
 export default function WatchPage() {
   const [searchParams] = useSearchParams();
-  const { id: routeId } = useParams();
+  const { id: encodedRouteId } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
   const backendBase = (import.meta.env.VITE_BACKEND_API_BASE || 'http://localhost:4000').replace(/\/$/, '');
-  const initialId = routeId || searchParams.get('id') || '';
+  const decodedRouteId = encodedRouteId ? decodeURIComponent(encodedRouteId) : '';
+  const initialId = decodedRouteId || searchParams.get('id') || '';
   const [id, setId] = useState(initialId);
   const nameParam = searchParams.get('name');
-  const fromParam = searchParams.get('from') || '';
+  const fromPathParam = searchParams.get('fromPath') || '';
   const resourceKey = searchParams.get('resourceKey') || searchParams.get('resourcekey') || '';
   const title = nameParam ? nameParam : (id ? `Video ${id}` : 'Missing file id');
-  const src = id ? `${backendBase}/drive/stream/${encodeURIComponent(id)}${resourceKey ? `?resourceKey=${encodeURIComponent(resourceKey)}` : ''}` : '';
+  const src = id ? `${backendBase}/b2/stream/${encodeURIComponent(id)}${resourceKey ? `?resourceKey=${encodeURIComponent(resourceKey)}` : ''}` : '';
   const [meta, setMeta] = useState(null);
   const metaUrl = id ? `${backendBase}/drive/meta/${encodeURIComponent(id)}${resourceKey ? `?resourceKey=${encodeURIComponent(resourceKey)}` : ''}` : '';
 
   useEffect(() => {
+    try {
+      console.log('[WatchPage] debug stream', { id, src, backendBase });
+    } catch (_) {
+      // ignore logging errors
+    }
+  }, [id, src, backendBase]);
+
+  useEffect(() => {
     if (!id) {
-      const resolved = routeId || searchParams.get('id') || '';
+      const fromRoute = encodedRouteId ? decodeURIComponent(encodedRouteId) : '';
+      const fromSearch = searchParams.get('id') || '';
+      const resolved = fromRoute || fromSearch || '';
       if (resolved) setId(resolved);
     }
     // react hooks deps: update if route or search params change
-  }, [id, routeId, searchParams]);
+  }, [id, encodedRouteId, searchParams]);
 
   useEffect(() => {
     let abort = false;
@@ -50,9 +61,10 @@ export default function WatchPage() {
           type="button"
           className="text-sm underline"
           onClick={() => {
-            const dest = fromParam || '';
-            if (dest) {
-              navigate(dest);
+            // Jika ada fromPathParam, bangun kembali URL /?path=... persis seperti di App.jsx
+            if (fromPathParam) {
+              const encodedPath = encodeURIComponent(fromPathParam).replace(/%2F/g, '/');
+              navigate(`/?path=${encodedPath}`);
               return;
             }
             if (typeof window !== 'undefined' && window.history.length > 1) {
@@ -84,7 +96,6 @@ export default function WatchPage() {
             <video
               key={id}
               controls
-              preload="metadata"
               className="w-full max-h-[70vh] bg-black"
             >
               <source src={src} type="video/mp4" />

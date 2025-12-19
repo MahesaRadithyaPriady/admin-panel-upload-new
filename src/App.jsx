@@ -29,7 +29,7 @@ export default function Home() {
   const [destQuery, setDestQuery] = useState("");
   const [destNewName, setDestNewName] = useState("");
   const START_FOLDER = "1hm9nX8C-mvS4sKgtuvsg6cmUlZhIcQ9F";
-  const [folderStack, setFolderStack] = useState([{ id: START_FOLDER, name: "NanimeID Pusat Video" }]);
+  const [folderStack, setFolderStack] = useState([{ id: START_FOLDER, name: "NanimeID" }]);
   const currentFolderId = folderStack[folderStack.length - 1].id;
   const [uploads, setUploads] = useState([]);
   const [selectedNames, setSelectedNames] = useState([]);
@@ -44,6 +44,7 @@ export default function Home() {
   const [encode, setEncode] = useState(true); // whether to encode videos after upload
   const [hasRestored, setHasRestored] = useState(false);
   const [wantRestorePath, setWantRestorePath] = useState(false);
+  const [hasInitialized, setHasInitialized] = useState(false);
   const fileInputRef = useRef(null);
   const backendBase = (import.meta.env.VITE_BACKEND_API_BASE || 'http://localhost:4000').replace(/\/$/, '');
 
@@ -83,37 +84,21 @@ export default function Home() {
         const decoded = decodeURIComponent(pathParam);
         const segments = decoded.split('/').filter(Boolean);
         if (segments.length === 0) return;
-        // Build initial stack with START_FOLDER root
-        const rootName = folderStack[0]?.name || 'NanimeID Pusat Video';
+        // Gunakan segmen pertama dari path sebagai nama root agar konsisten dengan URL
+        const rootName = segments[0];
         const stack = [{ id: START_FOLDER, name: rootName }];
-        // If first segment equals root name, skip it
-        const startIndex = segments[0] === rootName ? 1 : 0;
-        let parentId = START_FOLDER;
+        // Segmen setelah root dianggap prefix B2
+        const startIndex = 1;
+        // Bangun virtual folder id berbasis prefix B2, misal:
+        // NanimeID/Kira/Anime ->
+        //   seg[1] = Kira   -> id: "b2:Kira"
+        //   seg[2] = Anime  -> id: "b2:Kira/Anime"
         for (let i = startIndex; i < segments.length; i++) {
-          const seg = segments[i];
-          // Paginate through folders under current parent to find exact name match
-          let pageToken; let found = null;
-          while (!found) {
-            const sp = new URLSearchParams();
-            sp.set('folderId', parentId);
-            sp.set('type', 'folder');
-            sp.set('order', 'name_asc');
-            if (pageToken) sp.set('pageToken', pageToken);
-            const res = await fetch(`${backendBase}/drive/list?${sp.toString()}`, { cache: 'no-store' });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data?.error || 'Failed to resolve path');
-            const segNorm = (seg || '').trim();
-            found = (data.files || []).find(f => (f.name || '').trim() === segNorm) || null;
-            if (found) break;
-            pageToken = data.nextPageToken || null;
-            if (!pageToken) break;
-          }
-
-  
-
-          if (!found) break; // stop at deepest resolvable segment
-          stack.push({ id: found.id, name: found.name });
-          parentId = found.id;
+          const seg = (segments[i] || '').trim();
+          if (!seg) continue;
+          const prefixParts = segments.slice(startIndex, i + 1).map(s => (s || '').trim()).filter(Boolean);
+          const virtualId = `b2:${prefixParts.join('/')}`;
+          stack.push({ id: virtualId, name: seg });
         }
         if (!cancelled && stack.length > 1) {
           setFolderStack(stack);
@@ -124,7 +109,10 @@ export default function Home() {
       } catch (_) {
         // ignore restore errors
       } finally {
-        if (!cancelled) setHasRestored(true);
+        if (!cancelled) {
+          setHasRestored(true);
+          setHasInitialized(true);
+        }
       }
     })();
     return () => { cancelled = true; };
@@ -235,10 +223,10 @@ export default function Home() {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${backendBase}/drive/rename`, {
+      const res = await fetch(`${backendBase}/b2/rename`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: f.id, name: name.trim() })
+        body: JSON.stringify({ oldPath: f.id, newName: name.trim() })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || 'Rename failed');
@@ -422,21 +410,84 @@ export default function Home() {
     setLoading(true);
     setError("");
     try {
-      const sp = new URLSearchParams();
-      sp.set('folderId', folderId);
-      if (query) sp.set('search', query);
-      if (token) sp.set('pageToken', token);
-      if (order) sp.set('order', order);
-      if (typeFilter) sp.set('type', typeFilter);
-      const res = await fetch(`${backendBase}/drive/list?${sp.toString()}`);
-      const data = await res.json();
-      if (res.status === 403) {
-        navigate('/login', { replace: true });
+      // Bangun prefix dari breadcrumb (lewati root NanimeID)
+      const pathSegments = folderStack
+        .slice(1)
+        .map((f) => (f.name || "").trim())
+        .filter(Boolean);
+      const prefix = pathSegments.join("/");
+
+      // 1. ROOT: hanya ambil daftar folder level pertama via /b2/folders
+      if (!prefix) {
+        const sp = new URLSearchParams();
+        if (token) sp.set("pageToken", token);
+        sp.set("pageSize", "50");
+
+        const res = await fetch(`${backendBase}/b2/folders?${sp.toString()}`);
+        const data = await res.json();
+        if (res.status === 403) {
+          navigate("/login", { replace: true });
+          return;
+        }
+        if (!res.ok) throw new Error(data.error || "Failed to load folders");
+
+        const folders = (data.folders || []).map((f) => ({
+          ...f,
+          size: f.size ?? 0,
+          modifiedTime: f.modifiedTime || new Date().toISOString(),
+        }));
+
+        setFiles(folders);
+        setNextToken(data.nextPageToken || null);
         return;
       }
-      if (!res.ok) throw new Error(data.error || "Failed to load files");
-      setFiles(data.files || []);
-      setNextToken(data.nextPageToken || null);
+
+      // 2. DI DALAM FOLDER: ambil subfolder via /b2/folders dan file via /b2/list?type=file
+
+      // a) Query untuk folders
+      const spFolders = new URLSearchParams();
+      spFolders.set("prefix", prefix);
+      if (token) spFolders.set("pageToken", token);
+      spFolders.set("pageSize", "50");
+
+      // b) Query untuk files (hanya file langsung di prefix ini)
+      const spFiles = new URLSearchParams();
+      spFiles.set("prefix", prefix);
+      spFiles.set("type", "file");
+      spFiles.set("pageSize", "1000");
+
+      const [resFolders, resFiles] = await Promise.all([
+        fetch(`${backendBase}/b2/folders?${spFolders.toString()}`),
+        fetch(`${backendBase}/b2/list?${spFiles.toString()}`),
+      ]);
+
+      if (resFolders.status === 403 || resFiles.status === 403) {
+        navigate("/login", { replace: true });
+        return;
+      }
+
+      const dataFolders = await resFolders.json();
+      const dataFiles = await resFiles.json();
+
+      if (!resFolders.ok) throw new Error(dataFolders.error || "Failed to load folders");
+      if (!resFiles.ok) throw new Error(dataFiles.error || "Failed to load files");
+
+      const folders = (dataFolders.folders || []).map((f) => ({
+        ...f,
+        size: f.size ?? 0,
+        modifiedTime: f.modifiedTime || new Date().toISOString(),
+      }));
+
+      const filesOnly = (dataFiles.files || []).map((f) => ({
+        ...f,
+        modifiedTime: f.modifiedTime || new Date().toISOString(),
+      }));
+
+      // Gabungkan: folder dulu, lalu file langsung
+      setFiles([...folders, ...filesOnly]);
+
+      // Pagination mengikuti token dari /b2/folders (navigasi struktur)
+      setNextToken(dataFolders.nextPageToken || null);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -452,10 +503,13 @@ export default function Home() {
   }
 
   useEffect(() => {
+    // Jangan loadFiles sebelum proses restore path awal selesai,
+    // supaya tidak ada fetch /b2/list tanpa prefix ketika URL sudah punya ?path=...
+    if (!hasInitialized) return;
     if (wantRestorePath && !hasRestored) return; // wait until path restoration completes
     loadFiles(currentFolderId, pageToken);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentFolderId, pageToken, query, order, typeFilter, wantRestorePath, hasRestored]);
+  }, [currentFolderId, pageToken, query, order, typeFilter, wantRestorePath, hasRestored, hasInitialized]);
 
   async function onUpload(e) {
     e.preventDefault();
@@ -471,53 +525,85 @@ export default function Home() {
       return;
     }
     setError("");
-    const initial = selected.map(f => ({ name: f.name, progress: 0, uploadProgress: 0, encodeProgress: 0, status: 'uploading', error: '' }));
-    setUploads(prev => [...prev, ...initial]);
 
-    // Proses upload satu per satu agar encode dan IO tidak bertabrakan
+    // Bangun prefix B2 dari breadcrumb (lewati root NanimeID)
+    const pathSegments = folderStack
+      .slice(1)
+      .map((f) => (f.name || "").trim())
+      .filter(Boolean);
+    const basePrefix = pathSegments.join("/");
+
+    const initial = selected.map((f) => ({
+      name: f.name,
+      progress: 0,
+      uploadProgress: 0,
+      encodeProgress: 0,
+      status: "uploading",
+      error: "",
+    }));
+    setUploads((prev) => [...prev, ...initial]);
+
+    // Proses upload satu per satu ke B2
     for (let idx = 0; idx < selected.length; idx++) {
       const file = selected[idx];
-      // globalIndex dihitung terhadap uploads saat ini + offset idx
       const globalIndex = uploads.length + idx;
       // eslint-disable-next-line no-await-in-loop
       await new Promise((resolve) => {
         const fd = new FormData();
-        fd.set('folderId', currentFolderId);
-        fd.set('encode', encode ? '1' : '0');
-        fd.set('file', file, file.name);
+        if (basePrefix) fd.set("prefix", basePrefix);
+        fd.set("file", file, file.name);
+
         const xhr = new XMLHttpRequest();
-        xhr.open('POST', `${backendBase}/drive/upload`);
+        xhr.open("POST", `${backendBase}/b2/upload`);
+
         xhr.upload.onprogress = (ev) => {
           if (ev.lengthComputable) {
             const pct = Math.round((ev.loaded / ev.total) * 100);
-            setUploads(u => u.map((it, i) => i === globalIndex ? { ...it, uploadProgress: pct, status: 'uploading' } : it));
+            setUploads((u) =>
+              u.map((it, i) =>
+                i === globalIndex
+                  ? { ...it, uploadProgress: pct, status: "uploading" }
+                  : it,
+              ),
+            );
           }
         };
-        xhr.upload.onload = () => {
-          setUploads(u => u.map((it, i) => i === globalIndex ? { ...it, status: 'processing' } : it));
-        };
+
         xhr.onreadystatechange = async () => {
           if (xhr.readyState === 4) {
             if (xhr.status >= 200 && xhr.status < 300) {
-              let data = null;
-              try { data = JSON.parse(xhr.responseText); } catch {}
-              if (data && data.jobId) {
-                setUploads(u => u.map((it, i) => i === globalIndex ? { ...it, uploadProgress: 100, status: 'processing' } : it));
-                await pollEncoding(data.jobId, globalIndex, currentFolderId);
-                resolve();
-              } else {
-                setUploads(u => u.map((it, i) => i === globalIndex ? { ...it, uploadProgress: 100, encodeProgress: 100, progress: 100, status: 'done' } : it));
-                await loadFiles(currentFolderId);
-                resolve();
-              }
+              setUploads((u) =>
+                u.map((it, i) =>
+                  i === globalIndex
+                    ? {
+                        ...it,
+                        uploadProgress: 100,
+                        encodeProgress: 100,
+                        progress: 100,
+                        status: "done",
+                      }
+                    : it,
+                ),
+              );
+              await loadFiles(currentFolderId);
+              resolve();
             } else {
-              let msg = 'Upload failed';
-              try { msg = JSON.parse(xhr.responseText).error || msg; } catch {}
-              setUploads(u => u.map((it, i) => i === globalIndex ? { ...it, status: 'error', error: msg } : it));
+              let msg = "Upload failed";
+              try {
+                msg = JSON.parse(xhr.responseText).error || msg;
+              } catch {}
+              setUploads((u) =>
+                u.map((it, i) =>
+                  i === globalIndex
+                    ? { ...it, status: "error", error: msg }
+                    : it,
+                ),
+              );
               resolve();
             }
           }
         };
+
         xhr.send(fd);
       });
     }
@@ -537,52 +623,84 @@ export default function Home() {
       return;
     }
     setError("");
-    const initial = selected.map(f => ({ name: f.webkitRelativePath || f.name, progress: 0, uploadProgress: 0, encodeProgress: 0, status: 'uploading', error: '' }));
-    setUploads(prev => [...prev, ...initial]);
 
-    // Proses upload folder satu per satu agar encoding tidak paralel berlebihan
+    // Bangun prefix dasar dari breadcrumb saat ini (B2)
+    const pathSegments = folderStack
+      .slice(1)
+      .map((f) => (f.name || "").trim())
+      .filter(Boolean);
+    const basePrefix = pathSegments.join("/");
+
+    const initial = selected.map((f) => ({
+      name: f.webkitRelativePath || f.name,
+      progress: 0,
+      uploadProgress: 0,
+      encodeProgress: 0,
+      status: "uploading",
+      error: "",
+    }));
+    setUploads((prev) => [...prev, ...initial]);
+
+    // Proses upload folder satu per satu ke B2
     for (let idx = 0; idx < selected.length; idx++) {
       const file = selected[idx];
       const globalIndex = uploads.length + idx;
       // eslint-disable-next-line no-await-in-loop
       await new Promise((resolve) => {
         const fd = new FormData();
-        fd.set('folderId', currentFolderId);
         const rel = file.webkitRelativePath || file.name;
-        const parts = (rel || '').split('/');
-        const sub = parts.length > 1 ? parts.slice(0, -1).join('/') : '';
-        if (sub) fd.set('relativePath', sub);
-        fd.set('encode', encode ? '1' : '0');
-        fd.set('file', file, file.name);
+        const parts = (rel || "").split("/");
+        const sub = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
+        const fullPrefix = [basePrefix, sub].filter(Boolean).join("/");
+        if (fullPrefix) fd.set("prefix", fullPrefix);
+        fd.set("file", file, file.name);
+
         const xhr = new XMLHttpRequest();
-        xhr.open('POST', `${backendBase}/drive/upload`);
+        xhr.open("POST", `${backendBase}/b2/upload`);
+
         xhr.upload.onprogress = (ev) => {
           if (ev.lengthComputable) {
             const pct = Math.round((ev.loaded / ev.total) * 100);
-            setUploads(u => u.map((it, i) => i === globalIndex ? { ...it, uploadProgress: pct, status: 'uploading' } : it));
+            setUploads((u) =>
+              u.map((it, i) =>
+                i === globalIndex
+                  ? { ...it, uploadProgress: pct, status: "uploading" }
+                  : it,
+              ),
+            );
           }
         };
-        xhr.upload.onload = () => {
-          setUploads(u => u.map((it, i) => i === globalIndex ? { ...it, status: 'processing' } : it));
-        };
+
         xhr.onreadystatechange = async () => {
           if (xhr.readyState === 4) {
             if (xhr.status >= 200 && xhr.status < 300) {
-              let data = null;
-              try { data = JSON.parse(xhr.responseText); } catch {}
-              if (data && data.jobId) {
-                setUploads(u => u.map((it, i) => i === globalIndex ? { ...it, uploadProgress: 100, status: 'processing' } : it));
-                await pollEncoding(data.jobId, globalIndex, currentFolderId);
-                resolve();
-              } else {
-                setUploads(u => u.map((it, i) => i === globalIndex ? { ...it, uploadProgress: 100, encodeProgress: 100, progress: 100, status: 'done' } : it));
-                await loadFiles(currentFolderId);
-                resolve();
-              }
+              setUploads((u) =>
+                u.map((it, i) =>
+                  i === globalIndex
+                    ? {
+                        ...it,
+                        uploadProgress: 100,
+                        encodeProgress: 100,
+                        progress: 100,
+                        status: "done",
+                      }
+                    : it,
+                ),
+              );
+              await loadFiles(currentFolderId);
+              resolve();
             } else {
-              let msg = 'Upload failed';
-              try { msg = JSON.parse(xhr.responseText).error || msg; } catch {}
-              setUploads(u => u.map((it, i) => i === globalIndex ? { ...it, status: 'error', error: msg } : it));
+              let msg = "Upload failed";
+              try {
+                msg = JSON.parse(xhr.responseText).error || msg;
+              } catch {}
+              setUploads((u) =>
+                u.map((it, i) =>
+                  i === globalIndex
+                    ? { ...it, status: "error", error: msg }
+                    : it,
+                ),
+              );
               resolve();
             }
           }
@@ -644,17 +762,11 @@ export default function Home() {
   }
 
   async function onDelete(id) {
-    const f = files.find((x) => x.id === id);
-    const allowed = f && (f.capabilities?.canTrash || f.capabilities?.canDelete);
-    if (!allowed) {
-      setError('Tidak punya izin untuk menghapus item ini');
-      return;
-    }
     if (!confirm("Delete this item?")) return;
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${backendBase}/drive/delete?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+      const res = await fetch(`${backendBase}/b2/file?id=${encodeURIComponent(id)}`, { method: "DELETE" });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Delete failed");
       await loadFiles(currentFolderId);
@@ -673,10 +785,19 @@ export default function Home() {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${backendBase}/drive/create-folder`, {
+      // Bangun full prefix dari breadcrumb saat ini + nama folder baru
+      // Contoh: breadcrumb "Kira/Anime" + name "Season 1" -> prefix "Kira/Anime/Season 1"
+      const pathSegments = folderStack
+        .slice(1)
+        .map((f) => (f.name || "").trim())
+        .filter(Boolean);
+      const basePrefix = pathSegments.join("/");
+      const fullPrefix = [basePrefix, name].filter(Boolean).join("/");
+
+      const res = await fetch(`${backendBase}/b2/folder`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, parentId: currentFolderId }),
+        body: JSON.stringify({ prefix: fullPrefix }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Create folder failed");
@@ -699,11 +820,21 @@ export default function Home() {
   }
 
   function openWatch(f) {
-    const currentRel = `${location.pathname}${location.search}`;
+    // Ambil hanya nilai query `path` sebagai konteks asal, supaya tidak double-encode
+    let fromPath = '';
+    if (typeof window !== 'undefined') {
+      try {
+        const url = new URL(window.location.href);
+        fromPath = url.searchParams.get('path') || '';
+      } catch (_) {
+        fromPath = '';
+      }
+    }
+
     const base = `/watch/${encodeURIComponent(f.id)}`;
     const params = new URLSearchParams();
     if (f.name) params.set('name', f.name);
-    params.set('from', currentRel);
+    if (fromPath) params.set('fromPath', fromPath);
     navigate(`${base}?${params.toString()}`);
   }
 
@@ -744,7 +875,9 @@ export default function Home() {
     const url = new URL(window.location.href);
     const current = url.searchParams.get('path') || '';
     if (current !== names) {
-      url.searchParams.set('path', names);
+      // Encode path namun biarkan '/' tampil apa adanya di URL (bukan %2F)
+      const encoded = encodeURIComponent(names).replace(/%2F/g, '/');
+      url.search = `?path=${encoded}`;
       window.history.replaceState(null, '', url.toString());
     }
   }, [folderStack, hasRestored]);
@@ -757,7 +890,7 @@ export default function Home() {
   }
 
   function toggleSelectAll(checked) {
-    const selectable = files.filter((f) => (f.capabilities?.canTrash || f.capabilities?.canDelete)).map((f) => f.id);
+    const selectable = files.map((f) => f.id);
     if (checked) {
       setSelectedIds(selectable);
     } else {
@@ -772,18 +905,11 @@ export default function Home() {
     setError("");
     try {
       const allowedIds = files
-        .filter((f) => selectedIds.includes(f.id) && (f.capabilities?.canTrash || f.capabilities?.canDelete))
+        .filter((f) => selectedIds.includes(f.id))
         .map((f) => f.id);
-
-      if (allowedIds.length === 0) {
-        setError('Tidak punya izin untuk menghapus item terpilih');
-        setLoading(false);
-        return;
-      }
-
       const results = await Promise.allSettled(
-        allowedIds.map((id) =>
-          fetch(`${backendBase}/drive/delete?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
+        selectedIds.map((id) =>
+          fetch(`${backendBase}/b2/file?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
         ),
       );
       const failures = [];
@@ -804,12 +930,8 @@ export default function Home() {
       }
       await loadFiles(currentFolderId);
       setSelectedIds([]);
-      const skipped = selectedIds.length - allowedIds.length;
-      if (failures.length > 0 || skipped > 0) {
-        const parts = [];
-        if (failures.length > 0) parts.push(`${failures.length} gagal dihapus`);
-        if (skipped > 0) parts.push(`${skipped} dilewati (tidak ada izin)`);
-        setError(parts.join(', '));
+      if (failures.length > 0) {
+        setError(`${failures.length} gagal dihapus`);
       }
     } catch (e) {
       setError(e.message);
@@ -824,7 +946,7 @@ export default function Home() {
       // bukan origin Next.js panel.
       const base = import.meta.env.VITE_STREAM_BASE || 'http://localhost:4000';
       const normalizedBase = base.replace(/\/$/, '');
-      const url = `${normalizedBase}/drive/stream/${encodeURIComponent(f.id)}`;
+      const url = `${normalizedBase}/b2/stream/${encodeURIComponent(f.id)}`;
       await navigator.clipboard.writeText(url);
       setNotice('Link copied');
       setTimeout(() => setNotice(''), 1500);
@@ -1170,7 +1292,7 @@ export default function Home() {
                   <th className="px-3 py-2 text-left">
                     <input
                       type="checkbox"
-                      checked={(() => { const selectable = files.filter(f => (f.capabilities?.canTrash || f.capabilities?.canDelete)).map(f => f.id); return selectable.length > 0 && selectedIds.length === selectable.length; })()}
+                      checked={files.length > 0 && selectedIds.length === files.length}
                       onChange={(e) => toggleSelectAll(e.target.checked)}
                     />
                   </th>
@@ -1203,7 +1325,7 @@ export default function Home() {
                             <button className="underline" onClick={() => openFolder(f)}>
                               {f.name}
                             </button>
-                          ) : f.mimeType === 'video/mp4' ? (
+                          ) : (f.mimeType === 'video/mp4' || f.mimeType === 'application/octet-stream') ? (
                             <button
                               className="underline"
                               onClick={() => openWatch(f)}
@@ -1221,24 +1343,28 @@ export default function Home() {
                         <td className="px-3 py-2">{new Date(f.modifiedTime).toLocaleString()}</td>
                         <td className="px-3 py-2">
                           <div className="flex gap-2">
-                            <button
-                              onClick={() => onRename(f)}
-                              className="rounded-md border px-2 py-1 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-900"
-                              disabled={loading}
-                            >
-                              Rename
-                            </button>
-                            <button
-                              onClick={() => onCopyLink(f)}
-                              className="rounded-md border px-2 py-1 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-900"
-                              disabled={loading}
-                            >
-                              Copy link
-                            </button>
+                            {!isFolder && (
+                              <>
+                                <button
+                                  onClick={() => onRename(f)}
+                                  className="rounded-md border px-2 py-1 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-900"
+                                  disabled={loading}
+                                >
+                                  Rename
+                                </button>
+                                <button
+                                  onClick={() => onCopyLink(f)}
+                                  className="rounded-md border px-2 py-1 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-900"
+                                  disabled={loading}
+                                >
+                                  Copy link
+                                </button>
+                              </>
+                            )}
                             <button
                               onClick={() => onDelete(f.id)}
                               className="rounded-md border px-2 py-1 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-900 disabled:opacity-50"
-                              disabled={loading || !(f.capabilities?.canTrash || f.capabilities?.canDelete)}
+                              disabled={loading}
                             >
                               Delete
                             </button>
