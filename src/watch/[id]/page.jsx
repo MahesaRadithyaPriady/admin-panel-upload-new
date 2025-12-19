@@ -3,12 +3,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams, useParams, useNavigate, useLocation } from "react-router-dom";
 
-export default function WatchPage() {
+ export default function WatchPage() {
   const [searchParams] = useSearchParams();
   const { id: encodedRouteId } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
   const backendBase = (import.meta.env.VITE_BACKEND_API_BASE || 'http://localhost:4000').replace(/\/$/, '');
+  const streamBase = (import.meta.env.VITE_STREAM_BASE || 'http://localhost:4000').replace(/\/$/, '');
   const decodedRouteId = encodedRouteId ? decodeURIComponent(encodedRouteId) : '';
   const initialId = decodedRouteId || searchParams.get('id') || '';
   const [id, setId] = useState(initialId);
@@ -16,17 +17,17 @@ export default function WatchPage() {
   const fromPathParam = searchParams.get('fromPath') || '';
   const resourceKey = searchParams.get('resourceKey') || searchParams.get('resourcekey') || '';
   const title = nameParam ? nameParam : (id ? `Video ${id}` : 'Missing file id');
-  const src = id ? `${backendBase}/b2/stream/${encodeURIComponent(id)}${resourceKey ? `?resourceKey=${encodeURIComponent(resourceKey)}` : ''}` : '';
+  const src = id ? `${streamBase}/b2/stream/${encodeURIComponent(id)}${resourceKey ? `?resourceKey=${encodeURIComponent(resourceKey)}` : ''}` : '';
   const [meta, setMeta] = useState(null);
   const metaUrl = id ? `${backendBase}/drive/meta/${encodeURIComponent(id)}${resourceKey ? `?resourceKey=${encodeURIComponent(resourceKey)}` : ''}` : '';
 
   useEffect(() => {
     try {
-      console.log('[WatchPage] debug stream', { id, src, backendBase });
+      console.log('[WatchPage] debug stream', { id, src, streamBase, backendBase });
     } catch (_) {
       // ignore logging errors
     }
-  }, [id, src, backendBase]);
+  }, [id, src, streamBase, backendBase]);
 
   useEffect(() => {
     if (!id) {
