@@ -945,8 +945,14 @@ export default function Home() {
       // Gunakan langsung backend/stream base agar hasil copy sudah berupa URL CDN/backend,
       // bukan origin Next.js panel.
       const base = import.meta.env.VITE_STREAM_BASE || 'http://localhost:4000';
-      const normalizedBase = base.replace(/\/$/, '');
-      const url = `${normalizedBase}/b2/stream/${encodeURIComponent(f.id)}`;
+      const normalizedBase = String(base).replace(/\/+$/, '');
+      const rawPath = String(f?.id || '').replace(/^\/+/, '');
+      const encodedPath = rawPath
+        .split('/')
+        .filter(Boolean)
+        .map((seg) => encodeURIComponent(seg))
+        .join('/');
+      const url = `${normalizedBase}/${encodedPath}`;
       await navigator.clipboard.writeText(url);
       setNotice('Link copied');
       setTimeout(() => setNotice(''), 1500);
