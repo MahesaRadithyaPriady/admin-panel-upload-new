@@ -1,15 +1,10 @@
-# B2 Upload & File API
+# B2 Upload API
 
-Dokumen ini menjelaskan API upload video ke Backblaze B2 **serta operasi dasar file/folder** yang digunakan oleh panel admin:
-
-- Upload file video ke B2.
-- Membuat folder virtual.
-- Rename file/folder.
-- Delete file/folder.
+Dokumen ini menjelaskan API upload video ke Backblaze B2 beserta alur umum dan contoh penggunaan untuk frontend.
 
 ---
 
-## Endpoint Upload
+## Endpoint
 
 - **Method**: `POST`
 - **Path**: `/b2/upload`
@@ -23,10 +18,10 @@ Endpoint ini **hanya menerima file video**. File non-video (misalnya PDF, DOCX, 
 
 ## Request
 
-### Field `file` (wajib)
+### File part (wajib)
 
 - Tipe: `file` (multipart)
-- Deskripsi: File video yang akan di-upload.
+- Deskripsi: Satu atau lebih file video yang akan di-upload.
 - Validasi:
   - `mimetype` harus `video/*`, **atau**
   - Ekstensi file termasuk salah satu:
@@ -37,13 +32,10 @@ Endpoint ini **hanya menerima file video**. File non-video (misalnya PDF, DOCX, 
     - `.mov`
     - `.m4v`
 
-Jika file tidak memenuhi kriteria di atas, server akan mengembalikan:
+Catatan:
 
-```json
-{
-  "error": "Only video files are allowed for this endpoint"
-}
-```
+- Backend menerima **lebih dari satu file** dalam 1 request multipart.
+- Nama field file di FormData **tidak wajib** `file` (backend melakukan iterasi `request.parts()` dan mengambil semua part bertipe file). Namun tetap disarankan konsisten menggunakan `file`.
 
 ### Field `prefix` (opsional)
 
@@ -65,6 +57,12 @@ Contoh:
 - `prefix = "courses/kelas-a"`, file `intro.mp4` → `courses/kelas-a/intro.mp4`
 
 Jika `prefix` tidak diisi, file disimpan langsung di root bucket dengan nama asli file.
+
+### Field `fileSize` / `size` (opsional)
+
+- Tipe: `number` (string angka dalam multipart field)
+- Deskripsi: Ukuran file (byte). Field ini digunakan untuk membantu logging progres upload di server.
+- Catatan: Jika tidak dikirim, server masih bisa upload, tetapi log progres akan menampilkan `totalBytes: null` dan `percent: null`.
 
 ---
 
@@ -96,27 +94,40 @@ Keterangan:
 
 ### Error (contoh)
 
-- Tidak ada file:
+- Tidak ada file part sama sekali (bukan multipart / tidak ada file yang di-append):
 
   ```json
   {
-    "error": "No file provided"
+    "error": "No files uploaded",
+    "details": "Request did not contain any file parts. Ensure you send multipart/form-data with at least one file field."
   }
   ```
 
-- Tidak ada `filename`:
+- Ada file part tapi semuanya tidak valid (misalnya bukan video):
 
   ```json
   {
-    "error": "Missing filename"
+    "error": "No valid files uploaded",
+    "errors": [
+      {
+        "fileName": "document.pdf",
+        "error": "Only video files are allowed for this endpoint"
+      }
+    ]
   }
   ```
 
-- File bukan video:
+- Ada file part tapi malformed (tidak ada filename/stream):
 
   ```json
   {
-    "error": "Only video files are allowed for this endpoint"
+    "error": "No valid files uploaded",
+    "errors": [
+      {
+        "fileName": null,
+        "error": "Malformed file part (missing filename or stream)"
+      }
+    ]
   }
   ```
 
@@ -131,7 +142,7 @@ Keterangan:
 
 ---
 
-## Alur Backend Upload (ringkas)
+## Alur Backend (ringkas)
 
 1. Backend membaca `file` dan `prefix` dari `multipart/form-data`.
 2. Validasi nama file (`filename`) dan tipe file (hanya video).
@@ -139,173 +150,6 @@ Keterangan:
 4. Membaca stream file dan mengupload ke B2 **tanpa encoding** menggunakan `uploadFromStream`.
 5. Menyimpan metadata file ke SQLite melalui `upsertFile` (folder, nama file, path, ukuran, `content_type`, waktu upload).
 6. Mengembalikan response JSON berisi array `files` seperti di atas.
-
----
-
-## Endpoint Folder & File (CRUD Ringan)
-
-Bagian ini mendeskripsikan endpoint yang dipakai oleh frontend untuk operasi dasar di "file manager" B2:
-
-- Membuat folder virtual baru.
-- Rename file/folder yang sudah ada.
-- Menghapus file atau folder (rekursif pada level prefix).
-
-Semua operasi **wajib konsisten dengan katalog lokal (SQLite)** yang menyimpan metadata file.
-
-### 1. Membuat Folder
-
-- **Method**: `POST`
-- **Path**: `/b2/folder`
-- **Content-Type**: `application/json`
-
-#### Request Body
-
-```json
-{
-  "name": "Anime Baru",
-  "parentPrefix": "Kira/Anime"
-}
-```
-
-- `name` (wajib, string)
-  - Nama folder baru (satu segmen, tanpa `/`).
-- `parentPrefix` (opsional, string)
-  - Prefix parent tempat folder dibuat.
-  - Jika kosong → folder dibuat di root bucket.
-
-Backend menyusun `folderPath`:
-
-```text
-<parentPrefix>/<name>
-```
-
-Tanpa benar-benar membuat "folder" di B2 (karena B2 berbasis prefix). Disarankan:
-
-- Menyimpan satu row di tabel folder/file lokal (`files` atau tabel khusus folder) dengan:
-  - `file_path = folderPath + '/'` (konvensi),
-  - `content_type = 'application/vnd.google-apps.folder'`.
-
-#### Response (200)
-
-```json
-{
-  "folder": {
-    "id": "Kira/Anime/Anime Baru",
-    "name": "Anime Baru",
-    "mimeType": "application/vnd.google-apps.folder"
-  }
-}
-```
-
-#### Catatan Backend
-
-1. Validasi bahwa `name` tidak kosong dan tidak mengandung `/` berlebih.
-2. Normalisasi `parentPrefix` (hilangkan `/` di awal/akhir).
-3. Pastikan tidak ada folder dengan path yang sama di katalog lokal.
-4. Insert row baru ke SQLite.
-
-### 2. Rename File / Folder
-
-Frontend memanggil endpoint ini lewat `onRename` di `App.jsx`.
-
-- **Method**: `POST`
-- **Path**: `/b2/rename`
-- **Content-Type**: `application/json`
-
-#### Request Body
-
-```json
-{
-  "id": "Kira/Anime/Lama/Eps1.mp4",
-  "name": "Eps01.mp4"
-}
-```
-
-- `id` (wajib, string)
-  - Path penuh lama di B2 / katalog lokal (misal `file_path`).
-- `name` (wajib, string)
-  - Nama baru (segmen terakhir).
-
-Backend perlu membedakan dua kasus:
-
-- **Rename file** (`mimeType` bukan folder):
-  1. Hitung `newId` dengan mengganti segmen terakhir dari `id` dengan `name`.
-  2. Opsional: rename object di B2 (`copy` ke `newId` lalu hapus `id` lama).
-  3. Update row di SQLite: `file_path = newId`, `name = name`.
-
-- **Rename folder** (`mimeType = 'application/vnd.google-apps.folder'`):
-  1. Semua file yang `file_path`-nya diawali `id + '/'` harus di-update prefix-nya ke `newId + '/'`.
-  2. Jika menyimpan entitas folder tersendiri, update row tersebut.
-  3. Di B2 biasanya tidak perlu operasi khusus (kecuali ingin benar-benar memindahkan object di bucket).
-
-#### Response (200)
-
-```json
-{
-  "id": "Kira/Anime/Lama/Eps01.mp4",
-  "name": "Eps01.mp4"
-}
-```
-
-#### Response Error (contoh)
-
-```json
-{
-  "error": "Item not found"
-}
-```
-
-atau
-
-```json
-{
-  "error": "Rename failed",
-  "details": "<alasan teknis>"
-}
-```
-
-### 3. Delete File / Folder
-
-Frontend memanggil endpoint ini untuk tombol delete tunggal dan delete massal.
-
-- **Method**: `DELETE`
-- **Path**: `/b2/file`
-
-#### Query String
-
-```bash
-DELETE /b2/file?id=<encodedId>
-```
-
-- `id` (wajib) = path penuh file/folder di B2 / katalog lokal.
-
-#### Perilaku Backend
-
-1. Cari metadata item di SQLite berdasarkan `id`.
-2. Jika item adalah **file**:
-   - Hapus object di B2 (`fileName = id`).
-   - Hapus row terkait di SQLite.
-3. Jika item adalah **folder**:
-   - Ambil semua row yang `file_path` diawali `id + '/'`.
-   - Hapus seluruh object tersebut di B2.
-   - Hapus seluruh row di SQLite.
-
-Return JSON singkat:
-
-```json
-{
-  "ok": true
-}
-```
-
-Atau jika sebagian gagal (misal saat bulk delete):
-
-```json
-{
-  "ok": false,
-  "error": "Failed to delete some files"
-}
-```
 
 ---
 
@@ -336,6 +180,41 @@ async function uploadVideo({ file, prefix }) {
   return data.files[0]; // { id, name, mimeType, size, modifiedTime }
 }
 ```
+
+Catatan penting untuk frontend:
+
+- Jangan set header `Content-Type: multipart/form-data` secara manual saat mengirim `FormData`.
+  - Browser/axios yang akan mengisi `boundary`.
+  - Jika diset manual, server sering gagal parse multipart dan berujung `No files uploaded`.
+- Jika butuh log progres server yang lebih informatif, kirim `fileSize` atau `size` (byte) sebagai field.
+
+### Upload Video dengan `axios`
+
+```js
+import axios from 'axios';
+
+async function uploadVideoAxios({ file, prefix }) {
+  const formData = new FormData();
+  formData.append('file', file);
+  if (prefix) formData.append('prefix', prefix);
+  formData.append('fileSize', String(file.size));
+
+  const res = await axios.post('/b2/upload', formData, {
+    withCredentials: true,
+  });
+
+  return res.data;
+}
+```
+
+### Troubleshooting (catatan FE)
+
+- **Progress FE 100% tapi respons 400**
+  - Progress FE biasanya hanya menandakan upload dari browser ke server selesai.
+  - Server masih bisa gagal saat proses upload ke B2.
+  - Cek body respons server:
+    - Jika `error: "No files uploaded"`, kemungkinan request bukan multipart atau file tidak ikut terkirim.
+    - Jika `error: "No valid files uploaded"`, cek `errors[]` untuk alasan spesifik (bukan video / malformed / upload ke B2 gagal).
 
 ### Menggunakan ID untuk Streaming Video
 

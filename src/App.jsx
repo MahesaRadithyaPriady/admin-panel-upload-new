@@ -46,6 +46,7 @@ export default function Home() {
   const [wantRestorePath, setWantRestorePath] = useState(false);
   const [hasInitialized, setHasInitialized] = useState(false);
   const fileInputRef = useRef(null);
+  const uploadsRef = useRef([]);
   const backendBase = (import.meta.env.VITE_BACKEND_API_BASE || 'http://localhost:4000').replace(/\/$/, '');
 
   // Guard: jika token tidak ada di localStorage, paksa kembali ke halaman login
@@ -511,6 +512,10 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentFolderId, pageToken, query, order, typeFilter, wantRestorePath, hasRestored, hasInitialized]);
 
+  useEffect(() => {
+    uploadsRef.current = uploads;
+  }, [uploads]);
+
   async function onUpload(e) {
     e.preventDefault();
     const formEl = e.currentTarget;
@@ -541,17 +546,19 @@ export default function Home() {
       status: "uploading",
       error: "",
     }));
+    const baseIndex = uploadsRef.current.length;
     setUploads((prev) => [...prev, ...initial]);
 
     // Proses upload satu per satu ke B2
     for (let idx = 0; idx < selected.length; idx++) {
       const file = selected[idx];
-      const globalIndex = uploads.length + idx;
+      const globalIndex = baseIndex + idx;
       // eslint-disable-next-line no-await-in-loop
       await new Promise((resolve) => {
         const fd = new FormData();
-        if (basePrefix) fd.set("prefix", basePrefix);
-        fd.set("file", file, file.name);
+        if (basePrefix) fd.append("prefix", basePrefix);
+        fd.append("fileSize", String(file.size));
+        fd.append("file", file, file.name);
 
         const xhr = new XMLHttpRequest();
         xhr.open("POST", `${backendBase}/b2/upload`);
@@ -590,7 +597,8 @@ export default function Home() {
             } else {
               let msg = "Upload failed";
               try {
-                msg = JSON.parse(xhr.responseText).error || msg;
+                const parsed = JSON.parse(xhr.responseText);
+                msg = parsed?.error || parsed?.details || msg;
               } catch {}
               setUploads((u) =>
                 u.map((it, i) =>
@@ -639,12 +647,13 @@ export default function Home() {
       status: "uploading",
       error: "",
     }));
+    const baseIndex = uploadsRef.current.length;
     setUploads((prev) => [...prev, ...initial]);
 
     // Proses upload folder satu per satu ke B2
     for (let idx = 0; idx < selected.length; idx++) {
       const file = selected[idx];
-      const globalIndex = uploads.length + idx;
+      const globalIndex = baseIndex + idx;
       // eslint-disable-next-line no-await-in-loop
       await new Promise((resolve) => {
         const fd = new FormData();
@@ -652,8 +661,9 @@ export default function Home() {
         const parts = (rel || "").split("/");
         const sub = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
         const fullPrefix = [basePrefix, sub].filter(Boolean).join("/");
-        if (fullPrefix) fd.set("prefix", fullPrefix);
-        fd.set("file", file, file.name);
+        if (fullPrefix) fd.append("prefix", fullPrefix);
+        fd.append("fileSize", String(file.size));
+        fd.append("file", file, file.name);
 
         const xhr = new XMLHttpRequest();
         xhr.open("POST", `${backendBase}/b2/upload`);
@@ -692,7 +702,8 @@ export default function Home() {
             } else {
               let msg = "Upload failed";
               try {
-                msg = JSON.parse(xhr.responseText).error || msg;
+                const parsed = JSON.parse(xhr.responseText);
+                msg = parsed?.error || parsed?.details || msg;
               } catch {}
               setUploads((u) =>
                 u.map((it, i) =>
