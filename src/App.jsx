@@ -9,6 +9,15 @@ function bytesToSize(bytes) {
   return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${sizes[i]}`;
 }
 
+function normalizePrefix(prefix) {
+  return (prefix || "").replace(/^\/+|\/+$/g, "");
+}
+
+function buildFilePath({ prefix, fileName }) {
+  const p = normalizePrefix(prefix);
+  return p ? `${p}/${fileName}` : fileName;
+}
+
 export default function Home() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -516,6 +525,65 @@ export default function Home() {
     uploadsRef.current = uploads;
   }, [uploads]);
 
+  async function getS3PresignedPutUrl({ filePath, contentType, expiresInSeconds = 600 }) {
+    const sp = new URLSearchParams();
+    sp.set("filePath", filePath);
+    sp.set("contentType", contentType || "application/octet-stream");
+    sp.set("expiresInSeconds", String(expiresInSeconds));
+    const res = await fetch(`${backendBase}/b2/s3-presign?${sp.toString()}`, { method: "GET" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error || "Failed to get presigned URL");
+    if (!data?.url) throw new Error("Invalid presigned URL response");
+    return data;
+  }
+
+  async function commitB2Upload({ filePath, file }) {
+    const res = await fetch(`${backendBase}/b2/upload`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filePath,
+        size: file.size,
+        contentType: file.type || "application/octet-stream",
+        uploadedAt: new Date().toISOString(),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error || data?.details || "Commit failed");
+    return data;
+  }
+
+  function uploadFileViaPresignedPut({ url, contentType, file, onProgress }) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("PUT", url);
+      xhr.setRequestHeader("Content-Type", contentType || file.type || "application/octet-stream");
+
+      xhr.upload.onprogress = (ev) => {
+        if (!onProgress) return;
+        if (ev.lengthComputable) onProgress(ev.loaded, ev.total);
+      };
+
+      xhr.onreadystatechange = () => {
+        if (xhr.readyState !== 4) return;
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(true);
+          return;
+        }
+
+        let msg = "Upload failed";
+        try {
+          const parsed = JSON.parse(xhr.responseText);
+          msg = parsed?.message || parsed?.error || msg;
+        } catch {}
+        reject(new Error(msg));
+      };
+
+      xhr.onerror = () => reject(new Error("Network error while uploading"));
+      xhr.send(file);
+    });
+  }
+
   async function onUpload(e) {
     e.preventDefault();
     const formEl = e.currentTarget;
@@ -549,71 +617,46 @@ export default function Home() {
     const baseIndex = uploadsRef.current.length;
     setUploads((prev) => [...prev, ...initial]);
 
-    // Proses upload satu per satu ke B2
+    // Proses upload satu per satu langsung ke B2
     for (let idx = 0; idx < selected.length; idx++) {
       const file = selected[idx];
       const globalIndex = baseIndex + idx;
+      const filePath = buildFilePath({ prefix: basePrefix, fileName: file.name });
       // eslint-disable-next-line no-await-in-loop
-      await new Promise((resolve) => {
-        const fd = new FormData();
-        if (basePrefix) fd.append("prefix", basePrefix);
-        fd.append("fileSize", String(file.size));
-        fd.append("file", file, file.name);
-
-        const xhr = new XMLHttpRequest();
-        xhr.open("POST", `${backendBase}/b2/upload`);
-
-        xhr.upload.onprogress = (ev) => {
-          if (ev.lengthComputable) {
-            const pct = Math.round((ev.loaded / ev.total) * 100);
-            setUploads((u) =>
-              u.map((it, i) =>
-                i === globalIndex
-                  ? { ...it, uploadProgress: pct, status: "uploading" }
-                  : it,
-              ),
-            );
-          }
-        };
-
-        xhr.onreadystatechange = async () => {
-          if (xhr.readyState === 4) {
-            if (xhr.status >= 200 && xhr.status < 300) {
+      await (async () => {
+        try {
+          const contentType = file.type || "application/octet-stream";
+          const presign = await getS3PresignedPutUrl({ filePath, contentType });
+          await uploadFileViaPresignedPut({
+            url: presign.url,
+            contentType,
+            file,
+            onProgress: (loaded, total) => {
+              const pct = total ? Math.round((loaded / total) * 100) : 0;
               setUploads((u) =>
                 u.map((it, i) =>
-                  i === globalIndex
-                    ? {
-                        ...it,
-                        uploadProgress: 100,
-                        encodeProgress: 100,
-                        progress: 100,
-                        status: "done",
-                      }
-                    : it,
+                  i === globalIndex ? { ...it, uploadProgress: pct, status: "uploading" } : it,
                 ),
               );
-              await loadFiles(currentFolderId);
-              resolve();
-            } else {
-              let msg = "Upload failed";
-              try {
-                const parsed = JSON.parse(xhr.responseText);
-                msg = parsed?.error || parsed?.details || msg;
-              } catch {}
-              setUploads((u) =>
-                u.map((it, i) =>
-                  i === globalIndex
-                    ? { ...it, status: "error", error: msg }
-                    : it,
-                ),
-              );
-              resolve();
-            }
-          }
-        };
-
-        xhr.send(fd);
-      });
+            },
+          });
+          await commitB2Upload({ filePath, file });
+          setUploads((u) =>
+            u.map((it, i) =>
+              i === globalIndex
+                ? { ...it, uploadProgress: 100, encodeProgress: 100, progress: 100, status: "done" }
+                : it,
+            ),
+          );
+          await loadFiles(currentFolderId);
+        } catch (err) {
+          setUploads((u) =>
+            u.map((it, i) =>
+              i === globalIndex ? { ...it, status: "error", error: err?.message || "Upload failed" } : it,
+            ),
+          );
+        }
+      })();
     }
 
     formEl.reset();
@@ -650,75 +693,50 @@ export default function Home() {
     const baseIndex = uploadsRef.current.length;
     setUploads((prev) => [...prev, ...initial]);
 
-    // Proses upload folder satu per satu ke B2
+    // Proses upload folder satu per satu langsung ke B2
     for (let idx = 0; idx < selected.length; idx++) {
       const file = selected[idx];
       const globalIndex = baseIndex + idx;
       // eslint-disable-next-line no-await-in-loop
-      await new Promise((resolve) => {
-        const fd = new FormData();
+      await (async () => {
         const rel = file.webkitRelativePath || file.name;
         const parts = (rel || "").split("/");
         const sub = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
         const fullPrefix = [basePrefix, sub].filter(Boolean).join("/");
-        if (fullPrefix) fd.append("prefix", fullPrefix);
-        fd.append("fileSize", String(file.size));
-        fd.append("file", file, file.name);
-
-        const xhr = new XMLHttpRequest();
-        xhr.open("POST", `${backendBase}/b2/upload`);
-
-        xhr.upload.onprogress = (ev) => {
-          if (ev.lengthComputable) {
-            const pct = Math.round((ev.loaded / ev.total) * 100);
-            setUploads((u) =>
-              u.map((it, i) =>
-                i === globalIndex
-                  ? { ...it, uploadProgress: pct, status: "uploading" }
-                  : it,
-              ),
-            );
-          }
-        };
-
-        xhr.onreadystatechange = async () => {
-          if (xhr.readyState === 4) {
-            if (xhr.status >= 200 && xhr.status < 300) {
+        const filePath = buildFilePath({ prefix: fullPrefix, fileName: file.name });
+        try {
+          const contentType = file.type || "application/octet-stream";
+          const presign = await getS3PresignedPutUrl({ filePath, contentType });
+          await uploadFileViaPresignedPut({
+            url: presign.url,
+            contentType,
+            file,
+            onProgress: (loaded, total) => {
+              const pct = total ? Math.round((loaded / total) * 100) : 0;
               setUploads((u) =>
                 u.map((it, i) =>
-                  i === globalIndex
-                    ? {
-                        ...it,
-                        uploadProgress: 100,
-                        encodeProgress: 100,
-                        progress: 100,
-                        status: "done",
-                      }
-                    : it,
+                  i === globalIndex ? { ...it, uploadProgress: pct, status: "uploading" } : it,
                 ),
               );
-              await loadFiles(currentFolderId);
-              resolve();
-            } else {
-              let msg = "Upload failed";
-              try {
-                const parsed = JSON.parse(xhr.responseText);
-                msg = parsed?.error || parsed?.details || msg;
-              } catch {}
-              setUploads((u) =>
-                u.map((it, i) =>
-                  i === globalIndex
-                    ? { ...it, status: "error", error: msg }
-                    : it,
-                ),
-              );
-              resolve();
-            }
-          }
-        };
-
-        xhr.send(fd);
-      });
+            },
+          });
+          await commitB2Upload({ filePath, file });
+          setUploads((u) =>
+            u.map((it, i) =>
+              i === globalIndex
+                ? { ...it, uploadProgress: 100, encodeProgress: 100, progress: 100, status: "done" }
+                : it,
+            ),
+          );
+          await loadFiles(currentFolderId);
+        } catch (err) {
+          setUploads((u) =>
+            u.map((it, i) =>
+              i === globalIndex ? { ...it, status: "error", error: err?.message || "Upload failed" } : it,
+            ),
+          );
+        }
+      })();
     }
 
     formEl.reset();
