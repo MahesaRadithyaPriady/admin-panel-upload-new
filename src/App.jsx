@@ -25,8 +25,10 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [lastJobId, setLastJobId] = useState("");
   const [linkJobs, setLinkJobs] = useState([]); // {url, status: 'pending'|'processing'|'done'|'error', error?: string}
   const [linkText, setLinkText] = useState("");
+  const [encodeLinks, setEncodeLinks] = useState(true);
   const [showDestModal, setShowDestModal] = useState(false);
   const [bulkAction, setBulkAction] = useState(null); // 'copy' | 'move'
   const [destStack, setDestStack] = useState([]); // [{id,name}]
@@ -43,6 +45,9 @@ export default function Home() {
   const [uploads, setUploads] = useState([]);
   const [selectedNames, setSelectedNames] = useState([]);
   const [selectedTotal, setSelectedTotal] = useState(0);
+  const [selectedFolderFiles, setSelectedFolderFiles] = useState([]);
+  const [selectedFolderNames, setSelectedFolderNames] = useState([]);
+  const [selectedFolderTotal, setSelectedFolderTotal] = useState(0);
   const [selectedIds, setSelectedIds] = useState([]);
   const [query, setQuery] = useState("");
   const [pageToken, setPageToken] = useState(undefined);
@@ -55,8 +60,28 @@ export default function Home() {
   const [wantRestorePath, setWantRestorePath] = useState(false);
   const [hasInitialized, setHasInitialized] = useState(false);
   const fileInputRef = useRef(null);
+  const folderInputRef = useRef(null);
   const uploadsRef = useRef([]);
   const backendBase = (import.meta.env.VITE_BACKEND_API_BASE || 'http://localhost:4000').replace(/\/$/, '');
+
+  function saveLastJobId(jobId) {
+    if (!jobId) return;
+    setLastJobId(jobId);
+    try {
+      window.localStorage.setItem('last_upload_job_id', jobId);
+    } catch {
+      // ignore
+    }
+  }
+
+  useEffect(() => {
+    try {
+      const v = window.localStorage.getItem('last_upload_job_id');
+      if (v) setLastJobId(v);
+    } catch {
+      // ignore
+    }
+  }, []);
 
   // Guard: jika token tidak ada di localStorage, paksa kembali ke halaman login
   useEffect(() => {
@@ -512,6 +537,14 @@ export default function Home() {
     setSelectedNames(selected.slice(0, 3).map(f => f.name));
   }
 
+  function onSelectFolder(e) {
+    const input = e.currentTarget;
+    const selected = Array.from(input.files || []);
+    setSelectedFolderFiles(selected);
+    setSelectedFolderTotal(selected.length);
+    setSelectedFolderNames(selected.slice(0, 3).map((f) => f.webkitRelativePath || f.name));
+  }
+
   useEffect(() => {
     // Jangan loadFiles sebelum proses restore path awal selesai,
     // supaya tidak ada fetch /b2/list tanpa prefix ketika URL sudah punya ?path=...
@@ -551,6 +584,52 @@ export default function Home() {
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data?.error || data?.details || "Commit failed");
     return data;
+  }
+
+  function uploadFolderMultipart({ prefix, items, encode: wantEncode, onProgress }) {
+    return new Promise((resolve, reject) => {
+      const fd = new FormData();
+      if (prefix) fd.append("prefix", prefix);
+      if (wantEncode) fd.append("encode", "1");
+
+      for (const it of items) {
+        if (it.relativePath) fd.append("relativePath", it.relativePath);
+        fd.append("fileSize", String(it.file.size || 0));
+        fd.append("file", it.file, it.relativePath || it.file.name);
+      }
+
+      const xhr = new XMLHttpRequest();
+      const qp = new URLSearchParams();
+      if (prefix) qp.set('prefix', prefix);
+      if (wantEncode) qp.set('encode', '1');
+      const url = `${backendBase}/b2/upload-folder-multipart${qp.toString() ? `?${qp.toString()}` : ''}`;
+      xhr.open("POST", url);
+
+      xhr.upload.onprogress = (ev) => {
+        if (!onProgress) return;
+        if (ev.lengthComputable) onProgress(ev.loaded, ev.total);
+      };
+
+      xhr.onreadystatechange = () => {
+        if (xhr.readyState !== 4) return;
+        let data = {};
+        try {
+          data = JSON.parse(xhr.responseText || "{}");
+        } catch {
+          data = {};
+        }
+
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve({ status: xhr.status, data });
+          return;
+        }
+
+        reject(new Error(data?.error || data?.details || "Upload folder multipart failed"));
+      };
+
+      xhr.onerror = () => reject(new Error("Network error while uploading"));
+      xhr.send(fd);
+    });
   }
 
   function uploadFileViaPresignedPut({ url, contentType, file, onProgress }) {
@@ -617,6 +696,71 @@ export default function Home() {
     const baseIndex = uploadsRef.current.length;
     setUploads((prev) => [...prev, ...initial]);
 
+    if (encode) {
+      const items = selected.map((file) => ({ file, relativePath: file.name }));
+      try {
+        const { status, data } = await uploadFolderMultipart({
+          prefix: basePrefix,
+          items,
+          encode: true,
+          onProgress: (loaded, total) => {
+            const pct = total ? Math.round((loaded / total) * 100) : 0;
+            setUploads((u) =>
+              u.map((it, i) =>
+                i >= baseIndex && i < baseIndex + selected.length
+                  ? { ...it, uploadProgress: pct, status: "uploading" }
+                  : it,
+              ),
+            );
+          },
+        });
+
+        const jobId = data?.jobId;
+        if (jobId) {
+          saveLastJobId(jobId);
+          setNotice(`Job encode dibuat: ${jobId}`);
+          setTimeout(() => setNotice(''), 4000);
+        }
+
+        const okFiles = Array.isArray(data?.files) ? data.files : [];
+        const errors = Array.isArray(data?.errors) ? data.errors : [];
+        const okIds = new Set(okFiles.map((f) => f?.id).filter(Boolean));
+        const errByName = new Map(errors.map((er) => [er?.fileName, er]));
+
+        setUploads((u) =>
+          u.map((it, i) => {
+            if (i < baseIndex || i >= baseIndex + selected.length) return it;
+            const file = selected[i - baseIndex];
+            const objectKey = buildFilePath({ prefix: basePrefix, fileName: file.name });
+            const er = errByName.get(file.name);
+            if (er) return { ...it, status: "error", error: er?.error || "Upload failed" };
+            if (okIds.has(objectKey) || status === 200) {
+              return { ...it, uploadProgress: 100, progress: 100, status: "done" };
+            }
+            if (status === 207) {
+              return { ...it, status: "error", error: "Upload gagal untuk file ini" };
+            }
+            return it;
+          }),
+        );
+
+        await loadFiles(currentFolderId);
+      } catch (err) {
+        setUploads((u) =>
+          u.map((it, i) =>
+            i >= baseIndex && i < baseIndex + selected.length
+              ? { ...it, status: "error", error: err?.message || "Upload failed" }
+              : it,
+          ),
+        );
+      } finally {
+        formEl.reset();
+        setSelectedNames([]);
+        setSelectedTotal(0);
+      }
+      return;
+    }
+
     // Proses upload satu per satu langsung ke B2
     for (let idx = 0; idx < selected.length; idx++) {
       const file = selected[idx];
@@ -644,7 +788,7 @@ export default function Home() {
           setUploads((u) =>
             u.map((it, i) =>
               i === globalIndex
-                ? { ...it, uploadProgress: 100, encodeProgress: 100, progress: 100, status: "done" }
+                ? { ...it, uploadProgress: 100, progress: 100, status: "done" }
                 : it,
             ),
           );
@@ -667,8 +811,7 @@ export default function Home() {
   async function onUploadFolder(e) {
     e.preventDefault();
     const formEl = e.currentTarget;
-    const input = formEl.querySelector('input[name="folder"]');
-    const selected = Array.from(input.files || []);
+    const selected = Array.from(selectedFolderFiles || []);
     if (selected.length === 0) {
       setError("Pilih folder dengan berkas di dalamnya");
       return;
@@ -693,53 +836,86 @@ export default function Home() {
     const baseIndex = uploadsRef.current.length;
     setUploads((prev) => [...prev, ...initial]);
 
-    // Proses upload folder satu per satu langsung ke B2
-    for (let idx = 0; idx < selected.length; idx++) {
-      const file = selected[idx];
-      const globalIndex = baseIndex + idx;
-      // eslint-disable-next-line no-await-in-loop
-      await (async () => {
-        const rel = file.webkitRelativePath || file.name;
-        const parts = (rel || "").split("/");
-        const sub = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
-        const fullPrefix = [basePrefix, sub].filter(Boolean).join("/");
-        const filePath = buildFilePath({ prefix: fullPrefix, fileName: file.name });
-        try {
-          const contentType = file.type || "application/octet-stream";
-          const presign = await getS3PresignedPutUrl({ filePath, contentType });
-          await uploadFileViaPresignedPut({
-            url: presign.url,
-            contentType,
-            file,
-            onProgress: (loaded, total) => {
-              const pct = total ? Math.round((loaded / total) * 100) : 0;
-              setUploads((u) =>
-                u.map((it, i) =>
-                  i === globalIndex ? { ...it, uploadProgress: pct, status: "uploading" } : it,
-                ),
-              );
-            },
-          });
-          await commitB2Upload({ filePath, file });
+    const items = selected.map((file) => {
+      const rel = file.webkitRelativePath || file.name;
+      const parts = (rel || "").split("/").filter(Boolean);
+      const relativePath = parts.length > 1 ? parts.join("/") : file.name;
+      return { file, relativePath };
+    });
+
+    try {
+      const { status, data } = await uploadFolderMultipart({
+        prefix: basePrefix,
+        items,
+        encode,
+        onProgress: (loaded, total) => {
+          const pct = total ? Math.round((loaded / total) * 100) : 0;
           setUploads((u) =>
             u.map((it, i) =>
-              i === globalIndex
-                ? { ...it, uploadProgress: 100, encodeProgress: 100, progress: 100, status: "done" }
+              i >= baseIndex && i < baseIndex + selected.length
+                ? { ...it, uploadProgress: pct, status: "uploading" }
                 : it,
             ),
           );
-          await loadFiles(currentFolderId);
-        } catch (err) {
-          setUploads((u) =>
-            u.map((it, i) =>
-              i === globalIndex ? { ...it, status: "error", error: err?.message || "Upload failed" } : it,
-            ),
-          );
+        },
+      });
+
+      const jobId = data?.jobId;
+      if (jobId) {
+        saveLastJobId(jobId);
+        if (encode) {
+          setNotice(`Job encode dibuat: ${jobId}`);
+          setTimeout(() => setNotice(''), 4000);
         }
-      })();
+      }
+
+      const okFiles = Array.isArray(data?.files) ? data.files : [];
+      const errors = Array.isArray(data?.errors) ? data.errors : [];
+      const okIds = new Set(okFiles.map((f) => f?.id).filter(Boolean));
+      const errByName = new Map(errors.map((e) => [e?.fileName, e]));
+
+      setUploads((u) =>
+        u.map((it, i) => {
+          if (i < baseIndex || i >= baseIndex + selected.length) return it;
+          const file = selected[i - baseIndex];
+          const rel = file.webkitRelativePath || file.name;
+          const parts = (rel || "").split("/").filter(Boolean);
+          const relativePath = parts.length > 1 ? parts.join("/") : file.name;
+          const objectKey = [basePrefix, relativePath].filter(Boolean).join("/");
+
+          const err = errByName.get(file.name);
+          if (err) {
+            return { ...it, status: "error", error: err?.error || "Upload failed" };
+          }
+
+          if (okIds.has(objectKey) || status === 200) {
+            return { ...it, uploadProgress: 100, progress: 100, status: "done" };
+          }
+
+          if (status === 207) {
+            return { ...it, status: "error", error: "Upload gagal untuk file ini" };
+          }
+
+          return it;
+        }),
+      );
+
+      await loadFiles(currentFolderId);
+    } catch (err) {
+      setUploads((u) =>
+        u.map((it, i) =>
+          i >= baseIndex && i < baseIndex + selected.length
+            ? { ...it, status: "error", error: err?.message || "Upload failed" }
+            : it,
+        ),
+      );
     }
 
     formEl.reset();
+    if (folderInputRef.current) folderInputRef.current.value = "";
+    setSelectedFolderFiles([]);
+    setSelectedFolderNames([]);
+    setSelectedFolderTotal(0);
   }
 
   async function onUploadLinks(e) {
@@ -753,25 +929,43 @@ export default function Home() {
     setError('');
     setNotice('');
     // Initialize jobs
-    const jobs = lines.map(u => ({ url: u, status: 'pending', error: '' }));
+    const jobs = lines.map(u => ({ url: u, status: 'pending', error: '', jobId: '' }));
     setLinkJobs(jobs);
     setLoading(true);
     try {
+      const pathSegments = folderStack
+        .slice(1)
+        .map((f) => (f.name || "").trim())
+        .filter(Boolean);
+      const basePrefix = pathSegments.join("/");
+
       // Process one-by-one to keep UI responsive and simple
       let failCount = 0;
       for (let i = 0; i < jobs.length; i++) {
         setLinkJobs(prev => prev.map((j, idx) => idx === i ? { ...j, status: 'processing', error: '' } : j));
         try {
-          const res = await fetch(`${backendBase}/drive/upload-from-link`, {
+          const sourceUrl = jobs[i].url;
+          const urlObj = new URL(sourceUrl);
+          const pathName = urlObj.pathname || '';
+          const fileNameFromUrl = decodeURIComponent(pathName.split('/').filter(Boolean).slice(-1)[0] || '').trim();
+          const fileName = fileNameFromUrl || undefined;
+          const relativePath = fileNameFromUrl || undefined;
+
+          const res = await fetch(`${backendBase}/b2/import-by-url`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: jobs[i].url, folderId: currentFolderId }),
+            body: JSON.stringify({
+              sourceUrl,
+              prefix: basePrefix || undefined,
+              relativePath,
+              fileName,
+              encode: encodeLinks ? 1 : 0,
+            }),
           });
           const data = await res.json().catch(() => ({}));
-          if (!res.ok) throw new Error(data?.error || 'Gagal upload via link');
-          const hadError = Array.isArray(data?.results) && data.results[0]?.error;
-          if (hadError) throw new Error(data.results[0].error);
-          setLinkJobs(prev => prev.map((j, idx) => idx === i ? { ...j, status: 'done', error: '' } : j));
+          if (!res.ok) throw new Error(data?.error || 'Gagal import via URL');
+          if (data?.jobId) saveLastJobId(data.jobId);
+          setLinkJobs(prev => prev.map((j, idx) => idx === i ? { ...j, status: 'done', error: '', jobId: data?.jobId || '' } : j));
           await loadFiles(currentFolderId);
         } catch (err) {
           setLinkJobs(prev => prev.map((j, idx) => idx === i ? { ...j, status: 'error', error: err?.message || 'Gagal' } : j));
@@ -1004,8 +1198,7 @@ export default function Home() {
   }
 
   return (
-    <div className="min-h-screen bg-zinc-50 dark:bg-black text-black dark:text-zinc-50">
-      <main className="mx-auto max-w-4xl p-6">
+    <div className="rounded-xl border bg-white dark:bg-zinc-900 p-6">
         <h1 className="text-2xl font-semibold">{folderStack[folderStack.length - 1].name}</h1>
         <div className="mt-2">{breadcrumb}</div>
 
@@ -1148,26 +1341,77 @@ export default function Home() {
               <input id="encodeToggleFolder" type="checkbox" checked={encode} onChange={(e) => setEncode(e.target.checked)} />
               <label htmlFor="encodeToggleFolder">Encode setelah upload</label>
             </div>
-            <input name="folder" type="file" className="block w-full text-sm" webkitdirectory="" directory="" />
+            <input
+              ref={folderInputRef}
+              id="folderUpload"
+              name="folder"
+              type="file"
+              className="sr-only"
+              webkitdirectory=""
+              directory=""
+              onChange={onSelectFolder}
+            />
+            <label
+              htmlFor="folderUpload"
+              className="block rounded-md border border-dashed p-4 bg-white dark:bg-zinc-900 hover:bg-zinc-50 dark:hover:bg-zinc-950 transition cursor-pointer"
+            >
+              <div className="text-sm font-medium">Pilih folder</div>
+              <div className="text-xs opacity-70 mt-1">Semua file di dalam folder akan terunggah mengikuti struktur subfolder</div>
+              <div className="mt-3 inline-flex rounded-md border px-3 py-2 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800">Browse Folder</div>
+              {selectedFolderTotal > 0 ? (
+                <div className="mt-3 text-xs" onClick={(e) => e.preventDefault()}>
+                  <div className="opacity-70">File terpilih (tampil maks 3):</div>
+                  <div className="mt-2 rounded border bg-zinc-50 dark:bg-zinc-950 px-3 py-2">
+                    <ul className="space-y-1">
+                      {selectedFolderNames.map((n, i) => (
+                        <li key={`${n}-${i}`} className="truncate">{n}</li>
+                      ))}
+                    </ul>
+                    {selectedFolderTotal > 3 ? (
+                      <div className="opacity-70 mt-1">+{selectedFolderTotal - 3} lainnya</div>
+                    ) : null}
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-3 text-xs opacity-70" onClick={(e) => e.preventDefault()}>
+                  Belum ada folder terpilih
+                </div>
+              )}
+            </label>
             <button
               type="submit"
               className="mt-3 rounded-md bg-black px-4 py-2 text-white dark:bg-white dark:text-black disabled:opacity-50"
-              disabled={loading}
+              disabled={loading || selectedFolderTotal === 0}
             >
               Upload Folder
             </button>
           </form>
 
           <form onSubmit={onUploadLinks} className="rounded-lg border p-4">
-            <h2 className="font-medium mb-2">Upload via Link</h2>
-            <textarea name="links" value={linkText} onChange={(e) => setLinkText(e.target.value)} className="w-full rounded border px-3 py-2 text-sm bg-white dark:bg-zinc-900" rows="5" placeholder="Tempel beberapa URL, satu per baris" />
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="font-medium mb-1">Import via URL</h2>
+              </div>
+              <div className="text-sm flex items-center gap-2">
+                <input id="encodeToggleLinks" type="checkbox" checked={encodeLinks} onChange={(e) => setEncodeLinks(e.target.checked)} />
+                <label htmlFor="encodeToggleLinks">Encode</label>
+              </div>
+            </div>
+            <textarea
+              name="links"
+              value={linkText}
+              onChange={(e) => setLinkText(e.target.value)}
+              className="mt-3 w-full rounded border px-3 py-2 text-sm bg-white dark:bg-zinc-900"
+              rows="5"
+              placeholder="Tempel beberapa URL (http/https), satu per baris\nContoh: https://example.com/720p/eps1.mp4"
+            />
             <div className="mt-3 flex flex-wrap gap-2">
               <button
                 type="submit"
                 className="rounded-md bg-black px-4 py-2 text-white dark:bg-white dark:text-black disabled:opacity-50"
                 disabled={loading}
               >
-                Upload Links
+                Import URLs
               </button>
               {hasPixeldrain ? (
                 <button
@@ -1193,6 +1437,9 @@ export default function Home() {
                         {j.status === 'done' && 'Selesai'}
                         {j.status === 'error' && `Gagal (${j.error})`}
                       </span>
+                      {j.jobId ? (
+                        <span className="ml-2 opacity-70">Job: {j.jobId}</span>
+                      ) : null}
                     </li>
                   ))}
                 </ul>
@@ -1217,26 +1464,40 @@ export default function Home() {
               accept="video/*"
               onChange={onSelectFiles}
             />
-            <button
-              type="button"
-              onClick={() => fileInputRef.current && fileInputRef.current.click()}
-              className="rounded-md border px-4 py-2 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-900"
+            <div
+              className="rounded-md border border-dashed p-4 bg-white dark:bg-zinc-900 hover:bg-zinc-50 dark:hover:bg-zinc-950 transition"
             >
-              Pilih Video
-            </button>
-            {selectedTotal > 0 ? (
-              <div className="mt-2 text-xs">
-                <div className="opacity-70">File terpilih (maks 3):</div>
-                <ul className="list-disc ml-5 space-y-1">
-                  {selectedNames.map((n, i) => (
-                    <li key={`${n}-${i}`} className="truncate">{n}</li>
-                  ))}
-                </ul>
-                {selectedTotal > 3 ? (
-                  <div className="opacity-70 mt-1">+{selectedTotal - 3} lainnya</div>
-                ) : null}
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                <div className="text-sm">
+                  <div className="font-medium">Pilih video untuk diunggah</div>
+                  <div className="text-xs opacity-70">Maksimum 10 file per unggahan</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current && fileInputRef.current.click()}
+                  className="rounded-md border px-4 py-2 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                >
+                  Browse
+                </button>
               </div>
-            ) : null}
+              {selectedTotal > 0 ? (
+                <div className="mt-3 text-xs">
+                  <div className="opacity-70">File terpilih (tampil maks 3):</div>
+                  <div className="mt-2 rounded border bg-zinc-50 dark:bg-zinc-950 px-3 py-2">
+                    <ul className="space-y-1">
+                      {selectedNames.map((n, i) => (
+                        <li key={`${n}-${i}`} className="truncate">{n}</li>
+                      ))}
+                    </ul>
+                    {selectedTotal > 3 ? (
+                      <div className="opacity-70 mt-1">+{selectedTotal - 3} lainnya</div>
+                    ) : null}
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-3 text-xs opacity-70">Belum ada file terpilih</div>
+              )}
+            </div>
             <button
               type="submit"
               className="mt-3 rounded-md bg-black px-4 py-2 text-white dark:bg-white dark:text-black disabled:opacity-50"
@@ -1250,15 +1511,11 @@ export default function Home() {
                   <div key={`${u.name}-${i}`} className="text-sm space-y-1">
                     <div className="flex justify-between">
                       <span className="truncate max-w-[70%]">{u.name}</span>
-                      <span>{Math.max(u.uploadProgress || 0, u.encodeProgress || 0)}%</span>
+                      <span>{u.uploadProgress || 0}%</span>
                     </div>
                     <div className="text-xs opacity-70">Upload</div>
                     <div className="h-2 bg-zinc-200 dark:bg-zinc-800 rounded">
                       <div className="h-2 bg-blue-600 rounded" style={{ width: `${u.uploadProgress || 0}%` }} />
-                    </div>
-                    <div className="text-xs opacity-70 mt-1">Encode</div>
-                    <div className="h-2 bg-zinc-200 dark:bg-zinc-800 rounded">
-                      <div className="h-2 bg-purple-600 rounded" style={{ width: `${u.encodeProgress || 0}%` }} />
                     </div>
                     {u.status !== 'error' ? (
                       <div className="mt-1 text-xs opacity-70">
@@ -1438,7 +1695,6 @@ export default function Home() {
             </button>
           </div>
         </section>
-      </main>
     </div>
   );
 }
