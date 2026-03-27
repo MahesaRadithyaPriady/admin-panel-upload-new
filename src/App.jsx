@@ -18,6 +18,14 @@ function buildFilePath({ prefix, fileName }) {
   return p ? `${p}/${fileName}` : fileName;
 }
 
+function generateClientJobId() {
+  return `fe_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function isServerPhaseAfterRequestUpload(status) {
+  return ['done', 'partial', 'error', 'cancelled'].includes(String(status || '').trim());
+}
+
 export default function Home() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -62,6 +70,8 @@ export default function Home() {
   const fileInputRef = useRef(null);
   const folderInputRef = useRef(null);
   const uploadsRef = useRef([]);
+  const uploadJobEsRef = useRef(new Map());
+  const uploadJobRetryRef = useRef(new Map());
   const backendBase = (import.meta.env.VITE_BACKEND_API_BASE || 'http://localhost:4000').replace(/\/$/, '');
 
   function saveLastJobId(jobId) {
@@ -72,6 +82,247 @@ export default function Home() {
     } catch {
       // ignore
     }
+  }
+
+  function clearUploadJobRetry(jobId) {
+    const key = String(jobId || '').trim();
+    if (!key) return;
+    const retryId = uploadJobRetryRef.current.get(key);
+    if (!retryId) return;
+    try {
+      window.clearTimeout(retryId);
+    } catch {
+      // ignore
+    }
+    uploadJobRetryRef.current.delete(key);
+  }
+
+  function closeUploadJobMonitor(jobId) {
+    const key = String(jobId || '').trim();
+    if (!key) return;
+    clearUploadJobRetry(key);
+    const prev = uploadJobEsRef.current.get(key);
+    if (!prev) return;
+    try {
+      prev.close();
+    } catch {
+      // ignore
+    }
+    uploadJobEsRef.current.delete(key);
+  }
+
+  function queueUploadJobReconnect({ jobId, baseIndex, count, folderId, delayMs = 1200 }) {
+    const key = String(jobId || '').trim();
+    if (!key) return;
+    clearUploadJobRetry(key);
+    const retryId = window.setTimeout(() => {
+      uploadJobRetryRef.current.delete(key);
+      void monitorMultipartJob({ jobId: key, baseIndex, count, folderId });
+    }, delayMs);
+    uploadJobRetryRef.current.set(key, retryId);
+  }
+
+  function migrateUploadJobMonitor({ fromJobId, toJobId, baseIndex, count, folderId }) {
+    const fromKey = String(fromJobId || '').trim();
+    const toKey = String(toJobId || '').trim();
+    if (!toKey) return;
+    if (fromKey && fromKey !== toKey) {
+      closeUploadJobMonitor(fromKey);
+    }
+    void monitorMultipartJob({ jobId: toKey, baseIndex, count, folderId });
+  }
+
+  function updateUploadRange(baseIndex, count, updater) {
+    setUploads((prev) =>
+      prev.map((it, i) => {
+        if (i < baseIndex || i >= baseIndex + count) return it;
+        return updater(it, i - baseIndex);
+      }),
+    );
+  }
+
+  function logMultipartDebug(event, payload) {
+    try {
+      console.log(`[MultipartDebug] ${event}`, payload);
+    } catch {
+      // ignore
+    }
+  }
+
+  function applyMultipartJobState(job, baseIndex, count) {
+    if (!job) return false;
+    const rawStatus = String(job?.status || '').trim();
+    const percent = Math.max(0, Math.min(100, Number(job?.percent ?? 0)));
+    const current = String(job?.current || '').trim();
+    const isTerminal = rawStatus === 'done' || rawStatus === 'partial' || rawStatus === 'error' || rawStatus === 'cancelled';
+    const requestUploadFinished = isServerPhaseAfterRequestUpload(rawStatus);
+
+    let statusLabel = 'processing';
+    if (rawStatus === 'encoding') {
+      statusLabel = current ? `encoding ${current}` : 'encoding';
+    } else if (rawStatus === 'uploading') {
+      statusLabel = current ? `uploading ${current}` : 'uploading';
+    } else if (rawStatus === 'done') {
+      statusLabel = 'done';
+    } else if (rawStatus === 'partial') {
+      statusLabel = 'partial';
+    } else if (rawStatus === 'error') {
+      statusLabel = 'error';
+    } else if (rawStatus === 'cancelled') {
+      statusLabel = 'cancelled';
+    } else if (rawStatus) {
+      statusLabel = 'processing';
+    }
+
+    updateUploadRange(baseIndex, count, (it) => {
+      const next = {
+        ...it,
+        jobId: job?.id || it.jobId || '',
+        encodeVisible: true,
+        serverStatus: rawStatus || it.serverStatus || '',
+        uploadProgress: requestUploadFinished ? 100 : Number(it.uploadProgress ?? 0),
+        encodeProgress: Math.max(Number(it.encodeProgress ?? 0), isTerminal && rawStatus === 'done' ? 100 : percent),
+        progress: Math.max(Number(it.progress ?? 0), isTerminal && rawStatus === 'done' ? 100 : percent),
+        status: statusLabel,
+        error: rawStatus === 'error' || rawStatus === 'partial' || rawStatus === 'cancelled'
+          ? (job?.error || it.error || (rawStatus === 'partial' ? 'Sebagian file gagal diproses' : rawStatus === 'cancelled' ? 'Job dibatalkan' : 'Encode gagal'))
+          : '',
+      };
+      logMultipartDebug('applyMultipartJobState', {
+        jobId: job?.id || it.jobId || '',
+        rawStatus,
+        current,
+        percent,
+        baseIndex,
+        count,
+        prevUploadProgress: it.uploadProgress,
+        nextUploadProgress: next.uploadProgress,
+        prevEncodeProgress: it.encodeProgress,
+        nextEncodeProgress: next.encodeProgress,
+        prevProgress: it.progress,
+        nextProgress: next.progress,
+        prevStatus: it.status,
+        nextStatus: next.status,
+      });
+      return next;
+    });
+
+    return isTerminal;
+  }
+
+  async function fetchMultipartJob(jobId) {
+    const key = String(jobId || '').trim();
+    if (!key) return null;
+    const res = await fetch(`${backendBase}/b2/upload-job/${encodeURIComponent(key)}`, {
+      cache: 'no-store',
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(data?.error || 'Gagal mengambil status job');
+    return data;
+  }
+
+  async function monitorMultipartJob({ jobId, baseIndex, count, folderId }) {
+    const key = String(jobId || '').trim();
+    if (!key) return;
+
+    closeUploadJobMonitor(key);
+    logMultipartDebug('monitor:start', { jobId: key, baseIndex, count, folderId });
+
+    updateUploadRange(baseIndex, count, (it) => ({
+      ...it,
+      jobId: key,
+      encodeVisible: false,
+      status: it.status === 'done' ? it.status : 'processing',
+    }));
+
+    const es = new EventSource(`${backendBase}/b2/upload-job-sse/${encodeURIComponent(key)}`);
+    uploadJobEsRef.current.set(key, es);
+
+    es.addEventListener('hello', async () => {
+      logMultipartDebug('sse:hello', { jobId: key, baseIndex, count, folderId });
+      clearUploadJobRetry(key);
+      updateUploadRange(baseIndex, count, (it) => ({
+        ...it,
+        jobId: key,
+        encodeVisible: true,
+        status: it.status === 'done' ? it.status : 'processing',
+      }));
+
+      try {
+        const initialJob = await fetchMultipartJob(key);
+        const ended = applyMultipartJobState(initialJob, baseIndex, count);
+        if (!ended) return;
+        closeUploadJobMonitor(key);
+        await loadFiles(folderId);
+      } catch {
+        // ignore
+      }
+    });
+
+    es.addEventListener('update', async (ev) => {
+      try {
+        const parsed = JSON.parse(ev.data || '{}');
+        logMultipartDebug('sse:update', {
+          jobId: key,
+          status: parsed?.status,
+          current: parsed?.current,
+          percent: parsed?.percent,
+          baseIndex,
+          count,
+        });
+        const ended = applyMultipartJobState(parsed, baseIndex, count);
+        if (!ended) return;
+        closeUploadJobMonitor(key);
+        await loadFiles(folderId);
+      } catch {
+        // ignore
+      }
+    });
+
+    es.addEventListener('end', async () => {
+      logMultipartDebug('sse:end', { jobId: key, baseIndex, count, folderId });
+      closeUploadJobMonitor(key);
+      try {
+        const finalJob = await fetchMultipartJob(key);
+        applyMultipartJobState(finalJob, baseIndex, count);
+      } catch {
+        updateUploadRange(baseIndex, count, (it) => ({
+          ...it,
+          encodeProgress: Math.max(Number(it.encodeProgress ?? 0), Number(it.progress ?? 0)),
+        }));
+      }
+      await loadFiles(folderId);
+    });
+
+    es.addEventListener('not_found', () => {
+      logMultipartDebug('sse:not_found', { jobId: key, baseIndex, count, folderId });
+      closeUploadJobMonitor(key);
+      updateUploadRange(baseIndex, count, (it) => ({
+        ...it,
+        jobId: key,
+        encodeVisible: false,
+        encodeProgress: 0,
+        progress: 0,
+        status: 'processing',
+      }));
+      queueUploadJobReconnect({ jobId: key, baseIndex, count, folderId, delayMs: 1200 });
+    });
+
+    es.addEventListener('error', () => {
+      const hasVisibleEncode = uploadsRef.current
+        .slice(baseIndex, baseIndex + count)
+        .some((it) => Boolean(it?.encodeVisible));
+      logMultipartDebug('sse:error', { jobId: key, baseIndex, count, folderId, hasVisibleEncode });
+      closeUploadJobMonitor(key);
+      updateUploadRange(baseIndex, count, (it) => ({
+        ...it,
+        jobId: key,
+        encodeVisible: hasVisibleEncode ? Boolean(it.encodeVisible) : false,
+        status: it.status === 'done' ? it.status : 'processing',
+      }));
+      queueUploadJobReconnect({ jobId: key, baseIndex, count, folderId, delayMs: hasVisibleEncode ? 900 : 1500 });
+    });
   }
 
   useEffect(() => {
@@ -152,6 +403,36 @@ export default function Home() {
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      try {
+        for (const [id, es] of uploadJobEsRef.current.entries()) {
+          try {
+            es.close();
+          } catch {
+            // ignore
+          }
+          uploadJobEsRef.current.delete(id);
+        }
+      } catch {
+        // ignore
+      }
+
+      try {
+        for (const [id, retryId] of uploadJobRetryRef.current.entries()) {
+          try {
+            window.clearTimeout(retryId);
+          } catch {
+            // ignore
+          }
+          uploadJobRetryRef.current.delete(id);
+        }
+      } catch {
+        // ignore
+      }
+    };
   }, []);
 
   // Poll backend encoding progress and update UI
@@ -477,52 +758,64 @@ export default function Home() {
         return;
       }
 
-      // 2. DI DALAM FOLDER: ambil subfolder via /b2/folders dan file via /b2/list?type=file
+      if (typeFilter === 'folder') {
+        const spFolders = new URLSearchParams();
+        spFolders.set("prefix", prefix);
+        if (token) spFolders.set("pageToken", token);
+        spFolders.set("pageSize", "50");
 
-      // a) Query untuk folders
-      const spFolders = new URLSearchParams();
-      spFolders.set("prefix", prefix);
-      if (token) spFolders.set("pageToken", token);
-      spFolders.set("pageSize", "50");
+        const resFolders = await fetch(`${backendBase}/b2/folders?${spFolders.toString()}`);
+        const dataFolders = await resFolders.json();
 
-      // b) Query untuk files (hanya file langsung di prefix ini)
-      const spFiles = new URLSearchParams();
-      spFiles.set("prefix", prefix);
-      spFiles.set("type", "file");
-      spFiles.set("pageSize", "1000");
+        if (resFolders.status === 403) {
+          navigate("/login", { replace: true });
+          return;
+        }
 
-      const [resFolders, resFiles] = await Promise.all([
-        fetch(`${backendBase}/b2/folders?${spFolders.toString()}`),
-        fetch(`${backendBase}/b2/list?${spFiles.toString()}`),
-      ]);
+        if (!resFolders.ok) throw new Error(dataFolders.error || "Failed to load folders");
 
-      if (resFolders.status === 403 || resFiles.status === 403) {
+        const folders = (dataFolders.folders || []).map((f) => ({
+          ...f,
+          size: f.size ?? 0,
+          modifiedTime: f.modifiedTime || new Date().toISOString(),
+        }));
+
+        setFiles(folders);
+        setNextToken(dataFolders.nextPageToken || null);
+        return;
+      }
+
+      const spList = new URLSearchParams();
+      spList.set("prefix", prefix);
+      if (token) spList.set("pageToken", token);
+      spList.set("pageSize", "50");
+      if (typeFilter === 'file') spList.set("type", "file");
+
+      const resList = await fetch(`${backendBase}/b2/list?${spList.toString()}`);
+      const dataList = await resList.json();
+
+      if (resList.status === 403) {
         navigate("/login", { replace: true });
         return;
       }
 
-      const dataFolders = await resFolders.json();
-      const dataFiles = await resFiles.json();
+      if (!resList.ok) throw new Error(dataList.error || "Failed to load files");
 
-      if (!resFolders.ok) throw new Error(dataFolders.error || "Failed to load folders");
-      if (!resFiles.ok) throw new Error(dataFiles.error || "Failed to load files");
+      const items = (dataList.files || [])
+        .map((f) => ({
+          ...f,
+          size: f.size ?? 0,
+          modifiedTime: f.modifiedTime || new Date().toISOString(),
+        }))
+        .sort((a, b) => {
+          const aIsFolder = a?.mimeType === 'application/vnd.google-apps.folder';
+          const bIsFolder = b?.mimeType === 'application/vnd.google-apps.folder';
+          if (aIsFolder !== bIsFolder) return aIsFolder ? -1 : 1;
+          return String(a?.name || '').localeCompare(String(b?.name || ''));
+        });
 
-      const folders = (dataFolders.folders || []).map((f) => ({
-        ...f,
-        size: f.size ?? 0,
-        modifiedTime: f.modifiedTime || new Date().toISOString(),
-      }));
-
-      const filesOnly = (dataFiles.files || []).map((f) => ({
-        ...f,
-        modifiedTime: f.modifiedTime || new Date().toISOString(),
-      }));
-
-      // Gabungkan: folder dulu, lalu file langsung
-      setFiles([...folders, ...filesOnly]);
-
-      // Pagination mengikuti token dari /b2/folders (navigasi struktur)
-      setNextToken(dataFolders.nextPageToken || null);
+      setFiles(items);
+      setNextToken(dataList.nextPageToken || null);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -586,7 +879,7 @@ export default function Home() {
     return data;
   }
 
-  function uploadFolderMultipart({ prefix, items, encode: wantEncode, onProgress }) {
+  function uploadFolderMultipart({ prefix, items, encode: wantEncode, onProgress, jobId }) {
     return new Promise((resolve, reject) => {
       const fd = new FormData();
       if (prefix) fd.append("prefix", prefix);
@@ -602,12 +895,24 @@ export default function Home() {
       const qp = new URLSearchParams();
       if (prefix) qp.set('prefix', prefix);
       if (wantEncode) qp.set('encode', '1');
+      if (jobId) qp.set('jobId', jobId);
       const url = `${backendBase}/b2/upload-folder-multipart${qp.toString() ? `?${qp.toString()}` : ''}`;
       xhr.open("POST", url);
+      if (jobId) xhr.setRequestHeader('x-upload-job-id', jobId);
 
       xhr.upload.onprogress = (ev) => {
         if (!onProgress) return;
-        if (ev.lengthComputable) onProgress(ev.loaded, ev.total);
+        if (ev.lengthComputable) {
+          logMultipartDebug('xhr:upload-progress', {
+            jobId,
+            loaded: ev.loaded,
+            total: ev.total,
+            pct: ev.total ? Math.round((ev.loaded / ev.total) * 100) : 0,
+            itemCount: items.length,
+            prefix,
+          });
+          onProgress(ev.loaded, ev.total);
+        }
       };
 
       xhr.onreadystatechange = () => {
@@ -620,14 +925,32 @@ export default function Home() {
         }
 
         if (xhr.status >= 200 && xhr.status < 300) {
+          logMultipartDebug('xhr:done', {
+            jobId,
+            status: xhr.status,
+            responseJobId: data?.jobId,
+            responseStatus: data?.status,
+            encodeInBackground: data?.encodeInBackground,
+            queuedEncodeCount: data?.queuedEncodeCount,
+            fileCount: Array.isArray(data?.files) ? data.files.length : 0,
+            errorCount: Array.isArray(data?.errors) ? data.errors.length : 0,
+          });
           resolve({ status: xhr.status, data });
           return;
         }
 
+        logMultipartDebug('xhr:error-response', {
+          jobId,
+          status: xhr.status,
+          error: data?.error || data?.details || 'Upload folder multipart failed',
+        });
         reject(new Error(data?.error || data?.details || "Upload folder multipart failed"));
       };
 
-      xhr.onerror = () => reject(new Error("Network error while uploading"));
+      xhr.onerror = () => {
+        logMultipartDebug('xhr:network-error', { jobId, prefix, itemCount: items.length });
+        reject(new Error("Network error while uploading"));
+      };
       xhr.send(fd);
     });
   }
@@ -663,6 +986,179 @@ export default function Home() {
     });
   }
 
+  function getMultipartItemProgresses(items, loaded) {
+    const safeLoaded = Math.max(0, Number(loaded || 0));
+    let remaining = safeLoaded;
+
+    return items.map((it) => {
+      const size = Math.max(0, Number(it?.file?.size || 0));
+      if (size <= 0) {
+        const pct = remaining > 0 ? 100 : 0;
+        remaining = 0;
+        return pct;
+      }
+
+      const consumed = Math.max(0, Math.min(size, remaining));
+      const pct = Math.max(0, Math.min(100, Math.round((consumed / size) * 100)));
+      remaining = Math.max(0, remaining - size);
+      return pct;
+    });
+  }
+
+  function applyMultipartProgressToUploads({ scope, clientJobId, items, baseIndex, loaded, total }) {
+    const itemProgresses = getMultipartItemProgresses(items, loaded);
+    logMultipartDebug(`state:onProgress:${scope}`, {
+      clientJobId,
+      loaded,
+      total,
+      pct: total ? Math.round((loaded / total) * 100) : 0,
+      baseIndex,
+      count: items.length,
+      itemProgresses: itemProgresses.map((progress, index) => ({
+        name: items[index]?.relativePath || items[index]?.file?.name || `item-${index}`,
+        progress,
+      })),
+      prev: uploadsRef.current.slice(baseIndex, baseIndex + items.length).map((it) => ({
+        name: it?.name,
+        uploadProgress: it?.uploadProgress,
+        status: it?.status,
+      })),
+    });
+
+    setUploads((u) =>
+      u.map((it, i) => {
+        if (i < baseIndex || i >= baseIndex + items.length) return it;
+        const nextProgress = itemProgresses[i - baseIndex] ?? 0;
+        return {
+          ...it,
+          uploadProgress: Math.max(Number(it.uploadProgress ?? 0), nextProgress),
+          status: "uploading",
+        };
+      }),
+    );
+  }
+
+  async function runMultipartEncodeUpload({
+    scope,
+    selected,
+    items,
+    baseIndex,
+    basePrefix,
+    folderId,
+    getObjectKey,
+    getDebugNames,
+  }) {
+    const clientJobId = generateClientJobId();
+
+    try {
+      saveLastJobId(clientJobId);
+      logMultipartDebug(`upload:start:${scope}`, {
+        clientJobId,
+        baseIndex,
+        count: selected.length,
+        currentFolderId: folderId,
+        basePrefix,
+        names: getDebugNames(selected),
+      });
+
+      void monitorMultipartJob({
+        jobId: clientJobId,
+        baseIndex,
+        count: selected.length,
+        folderId,
+      });
+
+      const { status, data } = await uploadFolderMultipart({
+        prefix: basePrefix,
+        items,
+        encode: true,
+        jobId: clientJobId,
+        onProgress: (loaded, total) => {
+          applyMultipartProgressToUploads({
+            scope,
+            clientJobId,
+            items,
+            baseIndex,
+            loaded,
+            total,
+          });
+        },
+      });
+
+      const resolvedJobId = data?.jobId || clientJobId;
+      if (resolvedJobId) {
+        saveLastJobId(resolvedJobId);
+        setNotice(`Job encode dibuat: ${resolvedJobId}`);
+        setTimeout(() => setNotice(''), 4000);
+      }
+
+      logMultipartDebug(`upload:response:${scope}`, {
+        clientJobId,
+        resolvedJobId,
+        responseStatus: data?.status,
+        transportStatus: status,
+        encodeInBackground: data?.encodeInBackground,
+      });
+
+      const okFiles = Array.isArray(data?.files) ? data.files : [];
+      const errors = Array.isArray(data?.errors) ? data.errors : [];
+      const okIds = new Set(okFiles.map((f) => f?.id).filter(Boolean));
+      const errByName = new Map(errors.map((er) => [er?.fileName, er]));
+
+      setUploads((u) =>
+        u.map((it, i) => {
+          if (i < baseIndex || i >= baseIndex + selected.length) return it;
+          const file = selected[i - baseIndex];
+          const objectKey = getObjectKey(file);
+          const er = errByName.get(file.name);
+          if (er) return { ...it, status: "error", error: er?.error || "Upload failed" };
+          if (okIds.has(objectKey) || status === 200) {
+            logMultipartDebug(`state:set-processing:${scope}`, {
+              clientJobId,
+              resolvedJobId,
+              objectKey,
+              prevUploadProgress: it.uploadProgress,
+              prevStatus: it.status,
+            });
+            return {
+              ...it,
+              jobId: resolvedJobId,
+              uploadProgress: 100,
+              progress: 0,
+              encodeProgress: 0,
+              encodeVisible: false,
+              status: "processing",
+            };
+          }
+          if (status === 207) {
+            return { ...it, status: "error", error: "Upload gagal untuk file ini" };
+          }
+          return it;
+        }),
+      );
+
+      if (resolvedJobId) {
+        migrateUploadJobMonitor({
+          fromJobId: clientJobId,
+          toJobId: resolvedJobId,
+          baseIndex,
+          count: selected.length,
+          folderId,
+        });
+      }
+
+      await loadFiles(folderId);
+    } catch (err) {
+      setUploads((u) =>
+        u.map((it, i) =>
+          i >= baseIndex && i < baseIndex + selected.length
+            ? { ...it, status: "error", error: err?.message || "Upload failed" }
+            : it,
+        ),
+      );
+    }
+  }
+
   async function onUpload(e) {
     e.preventDefault();
     const formEl = e.currentTarget;
@@ -690,6 +1186,9 @@ export default function Home() {
       progress: 0,
       uploadProgress: 0,
       encodeProgress: 0,
+      encodeVisible: false,
+      jobId: '',
+      serverStatus: '',
       status: "uploading",
       error: "",
     }));
@@ -699,52 +1198,16 @@ export default function Home() {
     if (encode) {
       const items = selected.map((file) => ({ file, relativePath: file.name }));
       try {
-        const { status, data } = await uploadFolderMultipart({
-          prefix: basePrefix,
+        await runMultipartEncodeUpload({
+          scope: 'file',
+          selected,
           items,
-          encode: true,
-          onProgress: (loaded, total) => {
-            const pct = total ? Math.round((loaded / total) * 100) : 0;
-            setUploads((u) =>
-              u.map((it, i) =>
-                i >= baseIndex && i < baseIndex + selected.length
-                  ? { ...it, uploadProgress: pct, status: "uploading" }
-                  : it,
-              ),
-            );
-          },
+          baseIndex,
+          basePrefix,
+          folderId: currentFolderId,
+          getObjectKey: (file) => buildFilePath({ prefix: basePrefix, fileName: file.name }),
+          getDebugNames: (files) => files.map((file) => file.name),
         });
-
-        const jobId = data?.jobId;
-        if (jobId) {
-          saveLastJobId(jobId);
-          setNotice(`Job encode dibuat: ${jobId}`);
-          setTimeout(() => setNotice(''), 4000);
-        }
-
-        const okFiles = Array.isArray(data?.files) ? data.files : [];
-        const errors = Array.isArray(data?.errors) ? data.errors : [];
-        const okIds = new Set(okFiles.map((f) => f?.id).filter(Boolean));
-        const errByName = new Map(errors.map((er) => [er?.fileName, er]));
-
-        setUploads((u) =>
-          u.map((it, i) => {
-            if (i < baseIndex || i >= baseIndex + selected.length) return it;
-            const file = selected[i - baseIndex];
-            const objectKey = buildFilePath({ prefix: basePrefix, fileName: file.name });
-            const er = errByName.get(file.name);
-            if (er) return { ...it, status: "error", error: er?.error || "Upload failed" };
-            if (okIds.has(objectKey) || status === 200) {
-              return { ...it, uploadProgress: 100, progress: 100, status: "done" };
-            }
-            if (status === 207) {
-              return { ...it, status: "error", error: "Upload gagal untuk file ini" };
-            }
-            return it;
-          }),
-        );
-
-        await loadFiles(currentFolderId);
       } catch (err) {
         setUploads((u) =>
           u.map((it, i) =>
@@ -830,6 +1293,9 @@ export default function Home() {
       progress: 0,
       uploadProgress: 0,
       encodeProgress: 0,
+      encodeVisible: false,
+      jobId: '',
+      serverStatus: '',
       status: "uploading",
       error: "",
     }));
@@ -844,63 +1310,79 @@ export default function Home() {
     });
 
     try {
-      const { status, data } = await uploadFolderMultipart({
-        prefix: basePrefix,
-        items,
-        encode,
-        onProgress: (loaded, total) => {
-          const pct = total ? Math.round((loaded / total) * 100) : 0;
-          setUploads((u) =>
-            u.map((it, i) =>
-              i >= baseIndex && i < baseIndex + selected.length
-                ? { ...it, uploadProgress: pct, status: "uploading" }
-                : it,
-            ),
-          );
-        },
-      });
-
-      const jobId = data?.jobId;
-      if (jobId) {
-        saveLastJobId(jobId);
-        if (encode) {
-          setNotice(`Job encode dibuat: ${jobId}`);
-          setTimeout(() => setNotice(''), 4000);
+      if (encode) {
+        for (let idx = 0; idx < selected.length; idx++) {
+          const file = selected[idx];
+          const item = items[idx];
+          const itemBaseIndex = baseIndex + idx;
+          // eslint-disable-next-line no-await-in-loop
+          await runMultipartEncodeUpload({
+            scope: 'folder',
+            selected: [file],
+            items: [item],
+            baseIndex: itemBaseIndex,
+            basePrefix,
+            folderId: currentFolderId,
+            getObjectKey: (currentFile) => {
+              const rel = currentFile.webkitRelativePath || currentFile.name;
+              const parts = (rel || "").split("/").filter(Boolean);
+              const relativePath = parts.length > 1 ? parts.join("/") : currentFile.name;
+              return [basePrefix, relativePath].filter(Boolean).join("/");
+            },
+            getDebugNames: (files) => files.map((currentFile) => currentFile.webkitRelativePath || currentFile.name),
+          });
         }
+      } else {
+        const { status, data } = await uploadFolderMultipart({
+          prefix: basePrefix,
+          items,
+          encode: false,
+          jobId: '',
+          onProgress: (loaded, total) => {
+            applyMultipartProgressToUploads({
+              scope: 'folder',
+              clientJobId: '',
+              items,
+              baseIndex,
+              loaded,
+              total,
+            });
+          },
+        });
+
+        const okFiles = Array.isArray(data?.files) ? data.files : [];
+        const errors = Array.isArray(data?.errors) ? data.errors : [];
+        const okIds = new Set(okFiles.map((f) => f?.id).filter(Boolean));
+        const errByName = new Map(errors.map((e2) => [e2?.fileName, e2]));
+
+        setUploads((u) =>
+          u.map((it, i) => {
+            if (i < baseIndex || i >= baseIndex + selected.length) return it;
+            const file = selected[i - baseIndex];
+            const rel = file.webkitRelativePath || file.name;
+            const parts = (rel || "").split("/").filter(Boolean);
+            const relativePath = parts.length > 1 ? parts.join("/") : file.name;
+            const objectKey = [basePrefix, relativePath].filter(Boolean).join("/");
+
+            const err = errByName.get(file.name);
+            if (err) {
+              return { ...it, status: "error", error: err?.error || "Upload failed" };
+            }
+
+            if (okIds.has(objectKey) || status === 200) {
+              return { ...it, uploadProgress: 100, progress: 100, status: "done" };
+            }
+
+            if (status === 207) {
+              return { ...it, status: "error", error: "Upload gagal untuk file ini" };
+            }
+
+            return it;
+          }),
+        );
+
+        await loadFiles(currentFolderId);
       }
-
-      const okFiles = Array.isArray(data?.files) ? data.files : [];
-      const errors = Array.isArray(data?.errors) ? data.errors : [];
-      const okIds = new Set(okFiles.map((f) => f?.id).filter(Boolean));
-      const errByName = new Map(errors.map((e) => [e?.fileName, e]));
-
-      setUploads((u) =>
-        u.map((it, i) => {
-          if (i < baseIndex || i >= baseIndex + selected.length) return it;
-          const file = selected[i - baseIndex];
-          const rel = file.webkitRelativePath || file.name;
-          const parts = (rel || "").split("/").filter(Boolean);
-          const relativePath = parts.length > 1 ? parts.join("/") : file.name;
-          const objectKey = [basePrefix, relativePath].filter(Boolean).join("/");
-
-          const err = errByName.get(file.name);
-          if (err) {
-            return { ...it, status: "error", error: err?.error || "Upload failed" };
-          }
-
-          if (okIds.has(objectKey) || status === 200) {
-            return { ...it, uploadProgress: 100, progress: 100, status: "done" };
-          }
-
-          if (status === 207) {
-            return { ...it, status: "error", error: "Upload gagal untuk file ini" };
-          }
-
-          return it;
-        }),
-      );
-
-      await loadFiles(currentFolderId);
     } catch (err) {
       setUploads((u) =>
         u.map((it, i) =>
@@ -909,13 +1391,13 @@ export default function Home() {
             : it,
         ),
       );
+    } finally {
+      formEl.reset();
+      if (folderInputRef.current) folderInputRef.current.value = "";
+      setSelectedFolderFiles([]);
+      setSelectedFolderNames([]);
+      setSelectedFolderTotal(0);
     }
-
-    formEl.reset();
-    if (folderInputRef.current) folderInputRef.current.value = "";
-    setSelectedFolderFiles([]);
-    setSelectedFolderNames([]);
-    setSelectedFolderTotal(0);
   }
 
   async function onUploadLinks(e) {
@@ -1506,28 +1988,44 @@ export default function Home() {
               Upload
             </button>
             {uploads.length > 0 ? (
-              <div className="mt-4 space-y-3">
+              <div className="mt-4 space-y-3 min-w-0 overflow-hidden">
                 {uploads.slice(-10).map((u, i) => (
-                  <div key={`${u.name}-${i}`} className="text-sm space-y-1">
-                    <div className="flex justify-between">
-                      <span className="truncate max-w-[70%]">{u.name}</span>
-                      <span>{u.uploadProgress || 0}%</span>
+                  <div key={`${u.name}-${i}`} className="text-sm space-y-1 min-w-0 overflow-hidden">
+                    <div className="flex items-start justify-between gap-3 min-w-0">
+                      <span className="min-w-0 flex-1 break-all">{u.name}</span>
+                      <span className="shrink-0">{Math.max(0, Math.min(100, Number(u.uploadProgress ?? 0)))}%</span>
                     </div>
                     <div className="text-xs opacity-70">Upload</div>
                     <div className="h-2 bg-zinc-200 dark:bg-zinc-800 rounded">
                       <div className="h-2 bg-blue-600 rounded" style={{ width: `${u.uploadProgress || 0}%` }} />
                     </div>
+                    {u.encodeVisible ? (
+                      <>
+                        <div className="mt-2 flex justify-between gap-3 text-xs opacity-70">
+                          <span>Encode / Server</span>
+                          <span className="shrink-0">{Math.max(0, Math.min(100, Number(u.progress ?? u.encodeProgress ?? 0))) }%</span>
+                        </div>
+                        <div className="h-2 bg-zinc-200 dark:bg-zinc-800 rounded">
+                          <div className="h-2 bg-emerald-600 rounded" style={{ width: `${Math.max(0, Math.min(100, Number(u.progress ?? u.encodeProgress ?? 0)))}%` }} />
+                        </div>
+                      </>
+                    ) : null}
                     {u.status !== 'error' ? (
-                      <div className="mt-1 text-xs opacity-70">
+                      <div className="mt-1 text-xs opacity-70 break-all whitespace-normal">
                         {u.status === 'uploading' && 'Mengunggah…'}
                         {u.status && u.status.startsWith('encoding') && `Mengenkode (${u.status.split(' ')[1] || ''})…`}
                         {u.status && u.status.startsWith('uploading') && `Mengunggah (${u.status.split(' ')[1] || ''})…`}
                         {u.status === 'processing' && 'Memproses di server…'}
+                        {u.status === 'partial' && 'Selesai sebagian'}
+                        {u.status === 'cancelled' && 'Dibatalkan'}
                         {u.status === 'done' && 'Selesai'}
                       </div>
                     ) : null}
+                    {u.jobId ? (
+                      <div className="text-[11px] opacity-60 break-all whitespace-normal">Job: {u.jobId}</div>
+                    ) : null}
                     {u.status === 'error' ? (
-                      <div className="text-red-600 mt-1">{u.error || 'Gagal mengunggah'}</div>
+                      <div className="text-red-600 mt-1 break-all whitespace-normal">{u.error || 'Gagal mengunggah'}</div>
                     ) : null}
                   </div>
                 ))}

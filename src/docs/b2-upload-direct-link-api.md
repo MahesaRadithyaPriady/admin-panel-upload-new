@@ -15,6 +15,11 @@ Bedanya dengan `upload-folder-multipart`:
 2. FE `PUT` binary ke `uploadUrl`.
 3. FE pantau progress lewat polling / SSE menggunakan `jobId`.
 
+Catatan tambahan:
+
+- Jika sumber videonya dari URL remote (bukan file lokal), gunakan endpoint **import by URL** (`POST /b2/import-by-url`).
+- Flow import by URL juga streaming (server fetch) dan bisa `encode=1` → HLS menggunakan `ffmpeg -c copy` (tanpa re-encode) + job progress yang sama.
+
 ---
 
 ## 1) Buat link upload
@@ -23,10 +28,29 @@ Bedanya dengan `upload-folder-multipart`:
 - **Path**: `/b2/direct-upload-link`
 - **Content-Type**: `application/json`
 
+Catatan:
+
+- Endpoint ini **tidak menerima URL video**.
+- FE hanya meminta token/link, lalu upload file video sebagai **raw binary stream** lewat `PUT`.
+
+### Field wajib
+
+- Wajib salah satu:
+  - `relativePath`, atau
+  - `fileName`
+
+### Field yang disarankan
+
+- `prefix`
+- `contentType`
+- `size`
+- `encode`
+
 ### Body
 
 ```json
 {
+  "jobId": "custom_job_123",
   "prefix": "test",
   "relativePath": "720p/eps1.mp4",
   "fileName": "eps1.mp4",
@@ -44,6 +68,7 @@ Keterangan:
 - `fileName` (opsional): dipakai bila `relativePath` tidak ada.
 - `contentType` (opsional): default `application/octet-stream`.
 - `size` (opsional): dipakai untuk logging.
+- `jobId` (opsional): FE boleh mengirim `jobId` sendiri agar bisa subscribe progress sebelum proses upload/encode selesai.
 - `encode` (opsional): jika `1`, backend akan encode ke **HLS** (tanpa re-encode, `ffmpeg -c copy`).
 
 ### Response
@@ -51,6 +76,7 @@ Keterangan:
 ```json
 {
   "jobId": "<jobId>",
+  "ssePath": "/b2/upload-job-sse/<jobId>",
   "method": "PUT",
   "uploadUrl": "/b2/direct-upload/<token>",
   "expiresInSeconds": 1800,
@@ -70,6 +96,15 @@ Catatan:
 - **Method**: `PUT`
 - **Path**: `/b2/direct-upload/:token`
 - **Body**: raw binary (file)
+
+Logic backend:
+
+- Jika `encode=1` saat buat link:
+  - stream dari client → `ffmpeg` (stdin)
+  - output HLS (`index.m3u8` + `.ts`) diupload ke B2
+  - nama folder HLS dan nama segmen dinormalisasi menjadi **URL-safe** agar aman dipakai di CDN/player
+- Jika `encode=0`:
+  - stream dari client → upload ke B2 sebagai file original
 
 Header yang disarankan:
 
@@ -105,6 +140,7 @@ Jika `encode=0`:
 ```json
 {
   "jobId": "<jobId>",
+  "ssePath": "/b2/upload-job-sse/<jobId>",
   "files": [
     {
       "id": "test/720p/eps1.mp4",
@@ -122,6 +158,7 @@ Jika `encode=1`:
 ```json
 {
   "jobId": "<jobId>",
+  "ssePath": "/b2/upload-job-sse/<jobId>",
   "files": [
     {
       "id": "test/720p/eps1/index.m3u8",
@@ -140,6 +177,8 @@ Jika `encode=1`:
 
 Gunakan endpoint job yang sama seperti flow multipart:
 
+- Setelah response sukses, FE bisa langsung menggunakan `jobId` atau `ssePath` dari response.
+
 - Polling:
   - `GET /b2/upload-job/:id`
   - `GET /b2/upload-job?id=<jobId>`
@@ -150,6 +189,25 @@ Gunakan endpoint job yang sama seperti flow multipart:
 
 - Cancel:
   - `DELETE /b2/upload-job/:id`
+
+---
+
+## Alternatif: Remote upload (Server fetch) + HLS
+
+Jika kamu ingin backend mengambil video dari URL remote lalu memprosesnya (tanpa FE upload binary), gunakan:
+
+- **Method**: `POST`
+- **Path**: `/b2/import-by-url`
+
+Ringkasnya:
+
+- `encode=1`:
+  - stream dari URL remote → `ffmpeg` (stdin)
+  - output HLS (`index.m3u8` + `.ts`) diupload ke B2
+  - **tanpa re-encode** (menggunakan `ffmpeg -c copy`)
+  - progress tetap lewat `jobId` + SSE yang sama (`/b2/upload-job-sse/:jobId`)
+- `encode=0`:
+  - stream dari URL remote → upload original ke B2
 
 ---
 

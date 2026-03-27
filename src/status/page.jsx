@@ -257,14 +257,14 @@ export default function StatusPage() {
       ) : (
         <div className="mt-6 grid gap-3">
           {items.map((j) => (
-            <div key={j.id} className="rounded-lg border p-4">
-              <div className="flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="text-sm font-medium truncate">{j.current || j.prefix || j.id}</div>
-                  <div className="text-xs opacity-70 mt-1">Status: {j.status || "-"}</div>
-                  <div className="text-xs opacity-70 mt-1 truncate">Job: {j.id}</div>
+            <div key={j.id} className="rounded-lg border p-4 overflow-hidden">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-medium break-all">{j.current || j.prefix || j.id}</div>
+                  <div className="text-xs opacity-70 mt-1 break-all">Status: {j.status || "-"}</div>
+                  <div className="text-xs opacity-70 mt-1 break-all">Job: {j.id}</div>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex min-w-0 flex-wrap items-center gap-2 sm:justify-end">
                   <button
                     type="button"
                     onClick={() => onDeleteJob(j.id)}
@@ -283,8 +283,8 @@ export default function StatusPage() {
                   style={{ width: `${Math.max(0, Math.min(100, Number(j.percent ?? 0)))}%` }}
                 />
               </div>
-              <div className="mt-3 grid gap-1 text-xs opacity-80">
-                <div>Prefix: {j.prefix || "-"}</div>
+              <div className="mt-3 grid gap-1 text-xs opacity-80 min-w-0">
+                <div className="break-all">Prefix: {j.prefix || "-"}</div>
                 <div>Done: {j.done ?? 0} / {j.total ?? 0}</div>
               </div>
             </div>
