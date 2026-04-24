@@ -7,6 +7,8 @@ import LoginPage from './login/page.jsx'
 import WatchPage from './watch/[id]/page.jsx'
 import Layout from './Layout.jsx'
 import StatusPage from './status/page.jsx'
+import ConvertPage from './convert/page.jsx'
+import ConvertJobPage from './convert-job/page.jsx'
 
 if (typeof window !== 'undefined') {
   try {
@@ -30,6 +32,8 @@ createRoot(document.getElementById('root')).render(
         <Route element={<Layout />}>
           <Route path="/" element={<App />} />
           <Route path="/status" element={<StatusPage />} />
+          <Route path="/convert" element={<ConvertPage />} />
+          <Route path="/convert-job" element={<ConvertJobPage />} />
         </Route>
         <Route path="/login" element={<LoginPage />} />
         <Route path="/watch/:id" element={<WatchPage />} />

@@ -24,6 +24,7 @@ export default function LoginPage() {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
+        console.error('[Login] API error response:', { status: res.status, statusText: res.statusText, data });
         const baseMessage = data?.message || data?.error || `Login gagal (status ${res.status})`;
         const prefix = data?.code ? `${data.code}: ` : '';
         setError(prefix + baseMessage);
@@ -38,7 +39,8 @@ export default function LoginPage() {
         }
       }
       navigate('/');
-    } catch (_) {
+    } catch (err) {
+      console.error('[Login] Network/fetch error:', err);
       setError('Login gagal');
     } finally {
       setLoading(false);

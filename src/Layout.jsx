@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { Files, ListChecks } from "lucide-react";
+import { Files, ListChecks, Clapperboard, Cpu } from "lucide-react";
 
 function SidebarLink({ to, icon: Icon, label }) {
   return (
@@ -34,6 +34,8 @@ export default function Layout() {
             <nav className="mt-2 grid gap-1">
               <SidebarLink to="/" icon={Files} label="File Manager" />
               <SidebarLink to="/status" icon={ListChecks} label="Status" />
+              <SidebarLink to="/convert" icon={Clapperboard} label="Convert" />
+              <SidebarLink to="/convert-job" icon={Cpu} label="Convert Job" />
             </nav>
           </aside>
 
